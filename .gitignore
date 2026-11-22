@@ -1,0 +1,12 @@
+node_modules/
+dist/
+server/dist/
+server/data/
+server/.env
+.env
+.env.*
+!.env.example
+*.log
+docs/service-inspection.json
+docs/service-inspection-summary.txt
+*.tsbuildinfo
