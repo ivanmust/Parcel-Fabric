@@ -241,3 +241,64 @@ lais.post("/transactions", async (req, res) => {
     throw new HttpError(502, "GIS could not validate or record the transaction. Contact the GIS integration administrator.", "lais_gis_unavailable");
   }
 });
+
+
+/**
+ * LAIS polling endpoint: report whether a submitted transaction was recorded
+ * and whether the GIS web editor has generated its named version.
+ */
+lais.get("/transactions/:transactionId", async (req, res) => {
+  const parsedId = z.string().trim().min(1).max(150).safeParse(req.params.transactionId);
+  if (!parsedId.success) {
+    throw new HttpError(400, "A valid Transaction_ID is required.", "invalid_transaction_id");
+  }
+  if (!config.LAIS_TRANSACTION_TABLE_URL) {
+    throw new HttpError(503, "LAIS GIS integration is not configured.", "lais_integration_not_configured");
+  }
+
+  try {
+    const token = await arcgisToken();
+    const result = await arcgisPost(`${config.LAIS_TRANSACTION_TABLE_URL}/query`, {
+      f: "json",
+      token,
+      where: `Transaction_ID = ${sqlString(parsedId.data)}`,
+      outFields: "UPI,Transaction_ID,Transaction_Status,Transaction_Date,case,validation_message,version_name,version_status,created_at",
+      returnGeometry: "false",
+      resultRecordCount: "2",
+    });
+    const records = result.features ?? [];
+    if (records.length === 0) {
+      res.status(404).json({
+        success: false,
+        message: "No accepted GIS transaction was found for this Transaction_ID. If submission returned case=No, correct the validation errors and resubmit.",
+        Transaction_ID: parsedId.data,
+      });
+      return;
+    }
+    if (records.length > 1) {
+      logger.error({ transactionId: parsedId.data }, "Duplicate LAIS Transaction_ID records found in GIS table");
+      throw new HttpError(409, "GIS contains duplicate records for this Transaction_ID. Contact the GIS integration administrator.", "duplicate_transaction_records");
+    }
+    const attributes = records[0].attributes ?? {};
+    const dateValue = attributes.Transaction_Date;
+    const createdValue = attributes.created_at;
+    res.json({
+      success: true,
+      data: {
+        UPI: attributes.UPI,
+        Transaction_ID: attributes.Transaction_ID,
+        Transaction_Status: attributes.Transaction_Status,
+        Transaction_Date: typeof dateValue === "number" ? new Date(dateValue).toISOString() : dateValue,
+        case: attributes.case,
+        validation_message: attributes.validation_message,
+        version_status: attributes.version_status ?? "Pending",
+        version_name: attributes.version_name ?? null,
+        created_at: typeof createdValue === "number" ? new Date(createdValue).toISOString() : createdValue ?? null,
+      },
+    });
+  } catch (error) {
+    if (error instanceof HttpError) throw error;
+    logger.error({ err: error, transactionId: parsedId.data }, "LAIS transaction status lookup failed");
+    throw new HttpError(502, "GIS could not retrieve the transaction status. Retry later or contact the GIS integration administrator.", "lais_status_unavailable");
+  }
+});
