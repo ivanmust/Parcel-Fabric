@@ -28,6 +28,8 @@ export function useKeyboardShortcuts() {
       // While the Editor is sketching, it owns undo/redo and Delete (vertex editing).
       if (isEditorWorkflowActive() && ["undo", "redo", "delete"].includes(cmd)) return;
       e.preventDefault();
+      // While a split line is drawn the sketch owns the keys; only Escape (cancel) is the app's.
+      if (ed.manualSplit?.phase === "drawing" && cmd !== "escape") return;
       runCommand(cmd);
     };
     window.addEventListener("keydown", onKey);

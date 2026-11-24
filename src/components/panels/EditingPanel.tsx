@@ -1,20 +1,18 @@
 import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
-import SnappingOptions from "@arcgis/core/views/interactive/snapping/SnappingOptions.js";
 import { useMapView, useLayerRegistryVersion } from "../../hooks/useMapController";
 import { useEditing, isDefaultVersion } from "../../stores/editingStore";
 import { useApp } from "../../stores/appStore";
 import { layerRegistry } from "../../gis/layers/layerRegistry";
 import { versionSession } from "../../gis/version-management/versionSession";
 import { recordService, recordsLayer, type RecordRow } from "../../gis/parcel-fabric/recordService";
+import { createSnappingOptions } from "../../gis/editing/snapping";
 import { registerEditor, isLayerEditable, type EditorElement } from "../../gis/editing/editorBridge";
 import { runCommand } from "../../app/commands";
 import { calciteInput } from "../../utils/calciteInput";
-import { parcelFabricService } from "../../gis/parcel-fabric/parcelFabricService";
+import { parcelFabricService, type TopologyProblem } from "../../gis/parcel-fabric/parcelFabricService";
 import { getMapController } from "../../gis/map/MapController";
 import { useAsyncAction } from "../../hooks/useAsyncAction";
 import { ErrorNotice } from "../common/ErrorNotice";
-
-const SNAP_ROLES = new Set(["parcel-polygon", "parcel-line", "points", "connection-lines", "records"]);
 
 export function EditingPanel() {
   useLayerRegistryVersion();
@@ -43,17 +41,7 @@ export function EditingPanel() {
     [layerRegistry.getVersion()],
   );
   const snappingOptions = useMemo(
-    () =>
-      new SnappingOptions({
-        enabled: true,
-        featureEnabled: true,
-        selfEnabled: true,
-        distance: 10,
-        featureSources: layerRegistry
-          .all()
-          .filter((i) => i.kind === "feature" && i.fabricRole && SNAP_ROLES.has(i.fabricRole))
-          .map((i) => ({ layer: i.layer, enabled: true })),
-      }),
+    () => createSnappingOptions(),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [layerRegistry.getVersion()],
   );
@@ -133,7 +121,7 @@ export function EditingPanel() {
         </section>
 
         {recordsLayer() && <ActiveRecordCard editing={editing} />}
-        {editing && !!layerRegistry.byRole("parcel-polygon") && <ParcelFabricCard />}
+        {!!layerRegistry.byRole("parcel-polygon") && <ParcelFabricCard key={current?.guid} />}
 
         {editing && !user?.permissions.includes("features:edit") && (
           <calcite-notice open kind="warning" scale="s">
@@ -174,9 +162,24 @@ type ValidationStatus = Awaited<ReturnType<typeof parcelFabricService.validation
 
 /** Parcel Fabric tools for the edit session: topology validation of the current map view. */
 function ParcelFabricCard() {
+  const session = useEditing((s) => s.session);
+  const editing = session === "editing";
+  const inDefault = useEditing(isDefaultVersion);
+  const canChange = editing && !inDefault;
   const fabricOps = useEditing((s) => s.fabricOpsInSession);
   const [status, setStatus] = useState<ValidationStatus | null>(null);
   const { busy, error, run } = useAsyncAction();
+  // A result no longer holds after Save, Discard, or starting or stopping editing.
+  useEffect(() => setStatus(null), [session]);
+
+  const showProblem = (problem: TopologyProblem) =>
+    run(async () => {
+      const ctrl = getMapController();
+      if (!ctrl.view) throw new Error("The map is not ready.");
+      const geometry = await parcelFabricService.problemGeometry(problem, ctrl.view.spatialReference);
+      if (!geometry) throw new Error("That error no longer exists. Check errors again.");
+      await ctrl.showOutline(geometry);
+    }, "Zooming to the error");
 
   const area = () => {
     const extent = getMapController().view?.extent;
@@ -196,7 +199,7 @@ function ParcelFabricCard() {
     run(async () => {
       const ids = await parcelFabricService.parcelsWithoutUpi(area());
       if (!ids.length) useApp.getState().notify("info", "Every parcel in this map view has a UPI");
-      else useEditing.getState().patch({ assignUpiTargets: ids });
+      else useEditing.getState().patch({ assignUpiTargets: ids, assignUpiFrom: [] });
     }, "Finding parcels without UPI");
   const errorTotal = status ? status.errors.reduce((n, e) => n + e.count, 0) : 0;
 
@@ -210,16 +213,21 @@ function ParcelFabricCard() {
         Merge and Split on parcels use Parcel Fabric operations: the original parcels are retired by the active record and kept as history.
       </p>
       <div className="ps-row" style={{ gap: 6, flexWrap: "wrap" }}>
-        <calcite-button scale="s" icon-start="check-shield" disabled={!!busy || undefined} onClick={() => void validate()}>
+        <calcite-button scale="s" icon-start="check-shield" disabled={!!busy || !canChange || undefined} onClick={() => void validate()}>
           Validate this map view
         </calcite-button>
         <calcite-button scale="s" appearance="outline" icon-start="refresh" disabled={!!busy || undefined} onClick={() => void check()}>
           Check errors
         </calcite-button>
-        <calcite-button scale="s" appearance="outline" icon-start="tag" disabled={!!busy || undefined} onClick={() => void assignMissing()}>
+        <calcite-button scale="s" appearance="outline" icon-start="tag" disabled={!!busy || !editing || undefined} onClick={() => void assignMissing()}>
           Assign UPIs
         </calcite-button>
       </div>
+      {!canChange && (
+        <div className="muted" id="validate-requirement" style={{ fontSize: 12 }}>
+          {inDefault ? "To validate, switch to a named version and start editing." : "Start editing to validate."} Check errors works without editing.
+        </div>
+      )}
       {status && (
         <div className="kv" id="parcel-fabric-status">
           <div className="k">Dirty areas</div>
@@ -232,7 +240,23 @@ function ParcelFabricCard() {
           ))}
           <div className="k">Total errors</div>
           <div>{errorTotal === 0 ? "None" : errorTotal}</div>
+          {status.elsewhere > 0 && (
+            <>
+              <div className="k">Outside this view</div>
+              <div>{status.elsewhere} more error(s): zoom out and check again</div>
+            </>
+          )}
         </div>
+      )}
+      {status && status.problems.length > 0 && (
+        <calcite-list id="parcel-fabric-problems" label="Errors in this map view" scale="s" style={{ maxHeight: 240, overflow: "auto" }}>
+          {status.problems.map((p) => (
+            <calcite-list-item key={`${p.layerKey}:${p.objectId}`} label={p.label} description={`${p.detail}. Click to zoom.`} onClick={() => void showProblem(p)} />
+          ))}
+        </calcite-list>
+      )}
+      {status && status.dirtyAreas > 0 && (
+        <div className="muted" style={{ fontSize: 12 }}>Parts of this view are not validated yet, so their errors can't be known. Validate to find them.</div>
       )}
       {fabricOps > 0 && (
         <calcite-notice open kind="brand" scale="s" icon="information">

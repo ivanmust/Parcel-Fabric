@@ -9,6 +9,7 @@ import { config } from "./config/env.js";
 import { logger, scrubUrl } from "./logging/logger.js";
 import { api } from "./routes/index.js";
 import { bookmarks } from "./routes/bookmarks.js";
+import { docs } from "./routes/docs.js";
 import { errorHandler, notFound } from "./middleware/errorHandler.js";
 
 export function createApp() {
@@ -77,6 +78,7 @@ export function createApp() {
   app.use(express.json({ limit: "256kb" }));
   app.use("/api", api);
   app.use("/api", bookmarks);
+  if (config.API_DOCS ? config.API_DOCS === "true" : config.NODE_ENV !== "production") app.use("/api", docs);
   app.use("/api", notFound);
 
   // Production: serve the built SPA from ../dist.

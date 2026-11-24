@@ -51,7 +51,7 @@ export function isEditorWorkflowActive(): boolean {
 }
 
 export function isLayerEditable(info: ServiceLayerInfo | undefined): boolean {
-  if (!info || info.kind !== "feature") return false;
+  if (!info || info.kind !== "feature" || info.layer.editingEnabled === false) return false;
   const ops = info.layer.capabilities?.operations;
   return !!ops && (ops.supportsAdd || ops.supportsUpdate || ops.supportsDelete) && ops.supportsEditing !== false;
 }

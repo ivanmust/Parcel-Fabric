@@ -9,11 +9,13 @@
     "typecheck": "tsc -b --noEmit",
     "lint": "eslint .",
     "preview": "vite preview --port 5174",
+    "test:unit": "node --test tests/unit/shapefile.test.mjs",
     "test:e2e:workspace": "node tests/e2e/workspace-test.mjs",
     "test:e2e:search": "node tests/e2e/search-test.mjs",
     "test:e2e:phase2": "node tests/e2e/phase2-ui.mjs",
     "test:e2e:editing": "node tests/e2e/phase2-test.mjs",
     "test:e2e:tools": "node tests/e2e/editing-tools-test.mjs",
+    "test:e2e:split": "node tests/e2e/split-validate-upload-test.mjs",
     "test:e2e:cleanup": "node tests/e2e/cleanup-versions.mjs"
   },
   "dependencies": {

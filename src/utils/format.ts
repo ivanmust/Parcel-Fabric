@@ -1,4 +1,3 @@
-import type { IconName } from "../types/icons";
 export function formatScale(scale: number): string {
   if (!scale) return "—";
   return `1:${Math.round(scale).toLocaleString("en-US")}`;
@@ -49,19 +48,5 @@ export function friendlyGeometryType(t: string | null | undefined): string {
       return "Multipoint";
     default:
       return t ? String(t) : "Table";
-  }
-}
-
-export function geometryIcon(t: string | null | undefined): IconName {
-  switch (friendlyGeometryType(t)) {
-    case "Polygon":
-      return "polygon";
-    case "Polyline":
-      return "line";
-    case "Point":
-    case "Multipoint":
-      return "point";
-    default:
-      return "table";
   }
 }

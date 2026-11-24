@@ -115,10 +115,15 @@ try {
   const chip = await page.evaluate(() => document.querySelector("button.ps-version-chip")?.textContent ?? "");
   check("Header shows active version", chip.includes(VERSION), chip.trim());
 
-  // ---- role rules are enforced by the version service itself, not only by hidden buttons
+  // ---- role rules are enforced by the version service itself, not only by hidden buttons.
+  // The real version service is swapped for an inert object meanwhile: if the permission check ever
+  // regressed, this must fail the test, never post to DEFAULT.
   const denied = await page.evaluate(async () => {
     const app = window.__ps.app.getState();
     const user = app.user;
+    const session = window.__ps.versionSession;
+    const realService = session.vms;
+    session.vms = {};
     app.setUser({ ...user, permissions: user.permissions.filter((p) => p !== "versions:post" && p !== "versions:manage") });
     const out = {};
     try {
@@ -133,6 +138,7 @@ try {
     } catch (e) {
       out.create = e.message;
     }
+    session.vms = realService;
     app.setUser(user);
     return out;
   });
@@ -244,6 +250,52 @@ try {
   await sleep(800);
   const after = await page.evaluate(() => ({ highlighted: window.__ps.app.getState().mapStatus.highlighted, properties: window.__ps.app.getState().properties.kind }));
   check("Clear selection removes the highlight and closes the parcel details", !after.highlighted && after.properties === "none" && !(await clearButton())?.enabled, JSON.stringify(after));
+
+  // ---- select by location with NOTHING selected: the source is the Plots in the map view
+  await key("Escape");
+  await key("C", ["Shift"]);
+  await sleep(1000);
+  await key("L", ["Shift"]);
+  await sleep(1500);
+  const sblForm = await page.evaluate(() => {
+    const d = document.querySelector("#dlg-select-location");
+    const target = d.querySelector("calcite-select");
+    const opt = [...target.querySelectorAll("calcite-option")].find((o) => o.textContent.startsWith("Points"));
+    opt.selected = true;
+    target.dispatchEvent(new CustomEvent("calciteSelectChange", { bubbles: true }));
+    return {
+      source: [...d.querySelectorAll("#sbl-source calcite-option")].find((o) => o.selected)?.textContent ?? "",
+      scope: [...d.querySelectorAll("#sbl-scope calcite-segmented-control-item")].find((i) => i.checked)?.value ?? "",
+      notice: !!d.querySelector('calcite-notice[kind="brand"]'),
+    };
+  });
+  check("With nothing selected, the dialog offers the parcels in the map view as the source", /^Plot/.test(sblForm.source) && sblForm.scope === "view" && !sblForm.notice, JSON.stringify(sblForm));
+  const expectedPoints = await page.evaluate(async () => {
+    const reg = window.__ps.registry;
+    const view = window.__ps.map.view;
+    const plots = reg.byRole("parcel-polygon").layer;
+    const points = reg.byRole("points").layer;
+    // every parcel in the view, fetched in batches below the service's 2,000-record limit
+    const plotIds = await plots.queryObjectIds(window.__ps.shown(plots, { geometry: view.extent, where: "1=1" }));
+    const features = [];
+    for (let i = 0; i < plotIds.length; i += 1000) features.push(...(await plots.queryFeatures(window.__ps.shown(plots, { objectIds: plotIds.slice(i, i + 1000), returnGeometry: true, outFields: [], outSpatialReference: view.spatialReference }))).features);
+    const ids = new Set();
+    for (let i = 0; i < features.length; i += 200) {
+      const geometry = { type: "polygon", spatialReference: view.spatialReference.toJSON(), rings: features.slice(i, i + 200).flatMap((f) => f.geometry.rings) };
+      for (const id of await points.queryObjectIds(window.__ps.shown(points, { geometry, spatialRelationship: "intersects", where: "1=1" }))) ids.add(id);
+    }
+    return { plots: features.length, points: ids.size };
+  });
+  await sleep(500);
+  const t0 = Date.now();
+  await click("#dlg-select-location", "Apply");
+  await waitFor(async () => (await ed()).selection.some((x) => x.name === "Points"), 60000, "points selected from the view");
+  const seconds = ((Date.now() - t0) / 1000).toFixed(1);
+  const viewSel = (await ed()).selection.find((x) => x.name === "Points");
+  check("Select by location from the map view selects the right points", viewSel.count === expectedPoints.points, `${viewSel.count} selected; ${expectedPoints.points} expected from ${expectedPoints.plots} parcels in view, in ${seconds} s`);
+
+  await key("C", ["Shift"]);
+  await sleep(800);
 
   // ---- switch back + delete via UI
   await page.click("button.ps-version-chip");

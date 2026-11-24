@@ -2,14 +2,18 @@ import esriRequest from "@arcgis/core/request.js";
 import { executeForCount, executeQueryJSON } from "@arcgis/core/rest/query.js";
 import type Extent from "@arcgis/core/geometry/Extent.js";
 import type Geometry from "@arcgis/core/geometry/Geometry.js";
+import Graphic from "@arcgis/core/Graphic.js";
+import type Polygon from "@arcgis/core/geometry/Polygon.js";
+import * as areaOperator from "@arcgis/core/geometry/operators/areaOperator.js";
 import type SpatialReference from "@arcgis/core/geometry/SpatialReference.js";
 import { layerRegistry, type ServiceLayerInfo } from "../layers/layerRegistry";
-import { sessionQuery, sessionRows, sqlList, sqlString } from "../layers/query";
+import { hasField, sessionQuery, sessionRows, sqlList, sqlString } from "../layers/query";
+import { ensureProjection, project } from "../geometry/coordinates";
 import { versionSession, type ServiceEditsJson } from "../version-management/versionSession";
 import { useEditing, isDefaultVersion } from "../../stores/editingStore";
 import { useApp } from "../../stores/appStore";
-import { arcgisError } from "../../services/arcgis/serviceMetadata";
-import { UPI_PATTERN } from "./upi";
+import { arcgisError, fetchServiceJson } from "../../services/arcgis/serviceMetadata";
+import { LOCATION_FIELDS, UPI_PATTERN } from "./upi";
 
 /**
  * Parcel Fabric operations through the ParcelFabricServer and ValidationServer REST extensions.
@@ -27,6 +31,8 @@ const SQUARE_METRE = 109404;
 interface ServerOpResult {
   success?: boolean;
   moment?: number;
+  /** evaluate: the area it validated. Absent when it validated nothing, even with success: true. */
+  validatedArea?: object;
   serviceEdits?: ServiceEditsJson[];
   error?: { message?: string; details?: string[] };
 }
@@ -47,8 +53,8 @@ function requireRecord() {
   return record;
 }
 
-/** Common checks and the POST itself. */
-async function callServer(url: string, params: Record<string, string>): Promise<ServerOpResult> {
+/** What every operation needs: an edit session of a named version, with nothing undone. */
+function requireFabricSession() {
   const ed = useEditing.getState();
   if (ed.session !== "editing" || !ed.current) throw new Error("Start editing first.");
   if (isDefaultVersion(ed)) throw new Error("Run Parcel Fabric operations in a named version, not in the default version.");
@@ -58,12 +64,18 @@ async function callServer(url: string, params: Record<string, string>): Promise<
   // before its next edit or on save. A server operation would build on them, and a later save could
   // remove the operation's results, so require a clean state first.
   if (versionSession.vms?.canRedo(ed.current)) throw new Error("You undid edits in this session. Save or discard first, then run the Parcel Fabric operation.");
+  return { gdbVersion: ed.current.name, sessionId };
+}
+
+/** Common checks and the POST itself. */
+async function callServer(url: string, params: Record<string, string>): Promise<ServerOpResult> {
+  const { gdbVersion, sessionId } = requireFabricSession();
   let data: ServerOpResult;
   try {
     const res = await esriRequest(url, {
       method: "post",
       responseType: "json",
-      query: { f: "json", gdbVersion: ed.current.name, sessionId, async: "false", ...params },
+      query: { f: "json", gdbVersion, sessionId, async: "false", ...params },
     });
     data = res.data as ServerOpResult;
   } catch (e) {
@@ -98,6 +110,48 @@ async function readParcels(objectIds: number[]): Promise<ParcelRef[]> {
     .filter((a) => !a.retiredbyrecord)
     .map((a) => ({ objectId: a[info.layer.objectIdField] as number, globalId: a[info.layer.globalIdField ?? "globalid"] as string, name: (a.name as string) ?? null }));
 }
+
+/** Slightly inside an area, so a feature that only touches its edge isn't counted as in it. */
+const inside = (area: Extent) => area.clone().expand(0.999);
+
+const isDirtyAreas = (i: ServiceLayerInfo) => /dirty/i.test(i.name);
+/** Retired dirty areas are validated already; errors marked as exceptions are accepted. */
+function openProblems(i: ServiceLayerInfo): string {
+  if (isDirtyAreas(i) && hasField(i.layer, "isretired")) return "(isretired = 0 OR isretired IS NULL)";
+  if (hasField(i.layer, "isexception")) return "(isexception = 0 OR isexception IS NULL)";
+  return "1=1";
+}
+
+let ruleNames: Promise<Map<number, string>> | null = null;
+/** Topology rule names by id, from the service's data elements. */
+function topologyRuleNames(): Promise<Map<number, string>> {
+  ruleNames ??= (async () => {
+    const topologyId = layerRegistry.featureServiceJson?.controllerDatasetLayers?.topologyLayerIds?.[0];
+    const url = useApp.getState().config?.services.featureServer;
+    if (topologyId === undefined || !url) return new Map<number, string>();
+    const json = await fetchServiceJson(`${url}/queryDataElements`, { query: { layers: JSON.stringify([topologyId]) } });
+    const rules: { ruleId: number; name?: string; topologyRuleType?: string }[] = json.layerDataElements?.[0]?.dataElement?.topologyRules ?? [];
+    // An unnamed rule shows its type in words, e.g. "Line endpoint covered by point".
+    const words = (type = "") => {
+      const text = type.replace(/^esriTRT/, "").replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase();
+      return text.charAt(0).toUpperCase() + text.slice(1);
+    };
+    return new Map(rules.map((r) => [r.ruleId, r.name || words(r.topologyRuleType)]));
+  })().catch((e) => {
+    ruleNames = null;
+    useApp.getState().log("warning", "validation", "Topology rule names could not be read", arcgisError(e).message);
+    return new Map<number, string>();
+  });
+  return ruleNames;
+}
+
+export interface TopologyProblem {
+  layerKey: string;
+  objectId: number;
+  label: string;
+  detail: string;
+}
+const MAX_PROBLEMS_LISTED = 100;
 
 export const parcelFabricService = {
   isParcelLayer(layerKey: string | undefined): boolean {
@@ -191,29 +245,162 @@ export const parcelFabricService = {
   },
 
   /**
-   * Evaluate the topology rules inside an area of the version being edited. The server marks the
-   * area validated and writes any errors to the topology error layers.
+   * Evaluate the topology rules inside an area of the version being edited.
+   *
+   * The area MUST be sent in the data's coordinate system. Given any other (e.g. the map's Web
+   * Mercator), the server answers success: true and validates nothing (verified live 2026-11-22).
    */
   async validate(area: Extent): Promise<{ moment?: number }> {
+    await ensureProjection();
+    const projected = project(area, parcelLayer().layer.spatialReference)?.extent;
+    if (!projected) throw new Error("The map view could not be converted to the data's coordinate system.");
+    const dirtyLayer = layerRegistry.allByRole("topology-error").find(isDirtyAreas);
+    const dirtyBefore = dirtyLayer ? await executeForCount(dirtyLayer.url, sessionQuery(dirtyLayer, { where: openProblems(dirtyLayer), geometry: inside(area) })) : 0;
     const result = await callServer(`${serviceUrls().validation}/evaluate`, {
-      evaluationArea: JSON.stringify({ xmin: area.xmin, ymin: area.ymin, xmax: area.xmax, ymax: area.ymax, spatialReference: area.spatialReference.toJSON() }),
+      evaluationArea: JSON.stringify({ xmin: projected.xmin, ymin: projected.ymin, xmax: projected.xmax, ymax: projected.ymax, spatialReference: projected.spatialReference.toJSON() }),
       evaluationType: JSON.stringify(["topologyRules"]),
       returnEdits: "false",
     });
     versionSession.recordServerOperation("Validate topology", result);
+    if (dirtyBefore && !result.validatedArea) throw new Error("The server reported success but validated nothing in this map view.");
     return { moment: result.moment };
   },
 
-  /** Count dirty areas and topology errors (point, line, polygon) inside an area, at the session moment. */
-  async validationStatus(area: Extent): Promise<{ dirtyAreas: number; errors: { layerKey: string; name: string; count: number }[] }> {
+  /**
+   * What validation left in an area, at the session moment: dirty areas, errors by type, a list of
+   * them to zoom to, and how many errors lie elsewhere in the version. Reading needs no edit session.
+   */
+  async validationStatus(area: Extent) {
     const layers = layerRegistry.allByRole("topology-error");
-    const counts = await Promise.all(
-      layers.map(async (i) => {
-        return { layerKey: i.key, name: i.name, count: await executeForCount(i.url, sessionQuery(i, { geometry: area })) };
-      }),
-    );
-    const dirty = counts.find((c) => /dirty/i.test(c.name));
-    return { dirtyAreas: dirty?.count ?? 0, errors: counts.filter((c) => c !== dirty) };
+    const within = inside(area);
+    const [names, found] = await Promise.all([
+      topologyRuleNames(),
+      Promise.all(
+        layers.map(async (info) => {
+          const where = openProblems(info);
+          const dirty = isDirtyAreas(info);
+          const oid = info.layer.objectIdField;
+          const count = await executeForCount(info.url, sessionQuery(info, { where, geometry: within }));
+          const total = dirty ? count : await executeForCount(info.url, sessionQuery(info, { where }));
+          const rows = count ? await sessionRows(info, { where, geometry: within, outFields: ["*"], num: MAX_PROBLEMS_LISTED }) : [];
+          return { info, dirty, oid, count, total, rows };
+        }),
+      ),
+    ]);
+    const errors = found.filter((f) => !f.dirty);
+    const problems: TopologyProblem[] = [...errors, ...found.filter((f) => f.dirty)]
+      .flatMap(({ info, dirty, oid, rows }) =>
+        rows.map((r) => ({
+          layerKey: info.key,
+          objectId: r[oid] as number,
+          label: dirty ? "Not validated yet" : (names.get(r.toporuleid as number) ?? `Topology rule ${String(r.toporuleid)}`),
+          detail: `${info.name} #${String(r[oid])}`,
+        })),
+      )
+      .slice(0, MAX_PROBLEMS_LISTED);
+    return {
+      dirtyAreas: found.find((f) => f.dirty)?.count ?? 0,
+      errors: errors.map(({ info, count }) => ({ layerKey: info.key, name: info.name, count })),
+      elsewhere: errors.reduce((n, f) => n + f.total - f.count, 0),
+      problems,
+    };
+  },
+
+  /** Geometry of a topology error or dirty area, in the given spatial reference. */
+  async problemGeometry(problem: TopologyProblem, outSpatialReference: SpatialReference) {
+    const info = layerRegistry.get(problem.layerKey);
+    if (!info) return null;
+    const q = sessionQuery(info, { objectIds: [problem.objectId], returnGeometry: true, outFields: [], outSpatialReference });
+    return (await executeQueryJSON(info.url, q)).features[0]?.geometry ?? null;
+  },
+
+  /** Throws unless a manual split can run now (named-version edit session, active record). */
+  requireSplitReady() {
+    requireFabricSession();
+    requireRecord();
+  },
+
+  /** A current parcel's exact geometry, in the data's coordinate system. */
+  async editableGeometry(objectId: number): Promise<Polygon> {
+    const info = parcelLayer();
+    const q = sessionQuery(info, { where: "retiredbyrecord IS NULL", objectIds: [objectId], returnGeometry: true, returnZ: true, outFields: [], outSpatialReference: info.layer.spatialReference });
+    const geometry = (await executeQueryJSON(info.url, q)).features[0]?.geometry;
+    if (!geometry) throw new Error("The selected parcel is historic or no longer exists.");
+    return geometry as Polygon;
+  },
+
+  /**
+   * Manual split, with lineage kept:
+   *  1. add the drawn part as a new parcel of the active record;
+   *  2. clip the parcel with it (DiscardArea): the server retires the parcel and creates the remainder;
+   *  3. build the record inside the parcel's extent only, for the new boundary line and its points;
+   *  4. clear what the remainder copied from the parcel and is no longer true (UPI, number, areas).
+   * The clipping-geometry form of clip is refused by this server, hence step 1.
+   */
+  async splitOff(objectId: number, drawnOn: Polygon, part: Polygon): Promise<number[]> {
+    const info = parcelLayer();
+    const { layer } = info;
+    const oid = layer.objectIdField;
+    const record = requireRecord();
+    requireFabricSession();
+    const [[parent], [original], geometry] = await Promise.all([readParcels([objectId]), sessionRows(info, { objectIds: [objectId], outFields: ["*"] }), this.editableGeometry(objectId)]);
+    if (!parent || !original) throw new Error("The selected parcel is historic or no longer exists.");
+    if (JSON.stringify(geometry.rings) !== JSON.stringify(drawnOn.rings)) throw new Error("The parcel changed after the line was drawn. Draw it again.");
+
+    const attributes: Record<string, unknown> = { createdbyrecord: record.globalId };
+    if (hasField(layer, "isseed")) attributes.isseed = 0;
+    for (const f of LOCATION_FIELDS) if (hasField(layer, f)) attributes[f] = original[f] ?? null;
+    const added = (await layer.applyEdits({ addFeatures: [new Graphic({ geometry: part, attributes })] })).addFeatureResults[0];
+    if (!added || added.error || typeof added.objectId !== "number") throw new Error(added?.error?.message ?? "The server did not add the new part.");
+    const partId = added.objectId;
+
+    let clipped: ServerOpResult;
+    try {
+      const partGuid = added.globalId || ((await sessionRows(info, { objectIds: [partId], outFields: ["globalid"] }))[0]?.globalid as string | undefined);
+      if (!partGuid) throw new Error("The new part has no GlobalID.");
+      const layerId = String(info.serviceLayerId);
+      clipped = await callServer(`${serviceUrls().fabric}/clip`, {
+        parentParcels: JSON.stringify([{ id: parent.globalId, layerId }]),
+        clippingParcels: JSON.stringify([{ id: partGuid, layerId }]),
+        clipOption: "DiscardArea",
+        record: record.globalId,
+        defaultAreaUnit: String(SQUARE_METRE),
+      });
+    } catch (e) {
+      // Nothing was clipped: take the added part out again.
+      const undone = await layer.applyEdits({ deleteFeatures: [{ objectId: partId }] as never }).then((r) => !r.deleteFeatureResults[0]?.error, () => false);
+      throw new Error(`${(e as Error).message}${undone ? "" : " The new part could not be removed again: use Discard."}`, { cause: e });
+    }
+    versionSession.recordServerOperation("Split parcel (manual)", clipped, { record: record.name, parcel: parent.name });
+
+    try {
+      const remainder = addedObjectIds(clipped, info).filter((id) => id !== partId);
+      if (remainder.length !== 1) throw new Error("The server did not return exactly one remainder parcel.");
+
+      const around = geometry.extent!.clone().expand(1.02);
+      const built = await callServer(`${serviceUrls().fabric}/build`, {
+        record: record.globalId,
+        buildExtent: JSON.stringify({ xmin: around.xmin, ymin: around.ymin, xmax: around.xmax, ymax: around.ymax, spatialReference: around.spatialReference.toJSON() }),
+      });
+      versionSession.recordServerOperation("Build split parcels", built, { record: record.name });
+
+      const ids = [partId, remainder[0]!];
+      const shapes = await executeQueryJSON(info.url, sessionQuery(info, { objectIds: ids, returnGeometry: true, outFields: [oid], outSpatialReference: layer.spatialReference }));
+      const updates = shapes.features.map((f) => {
+        const values: Record<string, unknown> = { [oid]: f.attributes[oid] };
+        if (f.attributes[oid] !== partId) {
+          for (const field of ["name", "parcel_number", "statedarea", "statedareaunit"]) if (hasField(layer, field)) values[field] = null;
+        }
+        // In this data "size" is the parcel's area in m².
+        if (hasField(layer, "size") && f.geometry) values.size = Math.abs(areaOperator.execute(f.geometry as Polygon));
+        return { attributes: values };
+      });
+      const failed = (await layer.applyEdits({ updateFeatures: updates as never })).updateFeatureResults.find((r) => r.error);
+      if (failed?.error) throw new Error(failed.error.message);
+      return ids;
+    } catch (e) {
+      throw new Error(`The parcel was cut, but the split didn't finish: ${(e as Error).message} Use Discard to roll it back.`, { cause: e });
+    }
   },
 
   /**

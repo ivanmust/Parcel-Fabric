@@ -42,7 +42,7 @@ export function AttributeTablePanel() {
     null;
 
   const canEditAttributes =
-    session === "editing" && hasPermission(user, "attributes:edit") && !!info?.layer.capabilities?.operations.supportsUpdate;
+    session === "editing" && hasPermission(user, "attributes:edit") && !!info?.layer.capabilities?.operations.supportsUpdate && info.layer.editingEnabled !== false;
 
   // Filter-by-extent follows the map while enabled.
   useEffect(() => {

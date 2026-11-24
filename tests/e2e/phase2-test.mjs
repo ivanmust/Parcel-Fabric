@@ -405,7 +405,7 @@ try {
   await deepClick("Validate this map view", { scope: "#parcel-fabric-card", tags: ["CALCITE-BUTTON"] });
   await waitFor(async () => page.evaluate(() => !!document.querySelector("#parcel-fabric-status")), 60000, "validation status");
   const valText = await page.evaluate(() => document.querySelector("#parcel-fabric-status")?.innerText.replace(/\s+/g, " ") ?? "");
-  check("Validate topology runs on the server and reports dirty areas and errors", /Dirty areas/.test(valText) && /Total errors/.test(valText), valText);
+  check("Validate topology really validates the map view (no dirty areas left in it)", /Dirty areas None/.test(valText) && /Total errors/.test(valText), valText);
 
   // ---- attribute table is editable during the session
   await key("3", ["Alt"]);

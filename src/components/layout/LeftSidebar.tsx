@@ -5,7 +5,7 @@ import type { LeftPanelId } from "../../types/app";
 import { Resizer } from "../common/Resizer";
 import { ContentsPanel } from "../panels/ContentsPanel";
 import { LayersPanel } from "../panels/LayersPanel";
-import { CatalogPanel } from "../panels/CatalogPanel";
+import { UploadPanel } from "../panels/UploadPanel";
 import { BookmarksPanel } from "../panels/BookmarksPanel";
 import { SelectionPanel } from "../panels/SelectionPanel";
 import { EditingPanel } from "../panels/EditingPanel";
@@ -14,7 +14,7 @@ import { EditingPanel } from "../panels/EditingPanel";
 const PANELS: { id: LeftPanelId; icon: IconName; label: string }[] = [
   { id: "contents", icon: "layers", label: "Contents" },
   { id: "layers", icon: "add-layer", label: "Layers" },
-  { id: "catalog", icon: "collection", label: "Catalog" },
+  { id: "upload", icon: "upload", label: "Upload Shapefile" },
   { id: "bookmarks", icon: "bookmark", label: "Bookmarks" },
   { id: "selection", icon: "select", label: "Selection" },
   { id: "editing", icon: "pencil", label: "Editing Tools" },
@@ -48,7 +48,7 @@ export function LeftSidebar({ open }: { open: boolean }) {
           <div key={p.id} className="ps-panel-host" hidden={active !== p.id}>
             {p.id === "contents" && <ContentsPanel />}
             {p.id === "layers" && <LayersPanel />}
-            {p.id === "catalog" && <CatalogPanel />}
+            {p.id === "upload" && <UploadPanel />}
             {p.id === "bookmarks" && <BookmarksPanel />}
             {p.id === "selection" && <SelectionPanel />}
             {p.id === "editing" && <EditingPanel />}

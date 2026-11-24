@@ -1,0 +1,452 @@
+openapi: 3.1.0
+info:
+  title: Rwanda Parcel Fabric API
+  version: 0.1.0
+  summary: Backend for the Rwanda Parcel Fabric web editing application.
+  description: |
+    The web application reads and edits the Parcel Fabric directly on ArcGIS Enterprise with the
+    signed-in user's own Portal token; ArcGIS authorises every read and edit. This API does not
+    proxy GIS data. It provides:
+
+    - **Configuration** the browser needs (service URLs, Portal address). No secrets.
+    - **Sessions:** resolves a Portal token into the application role and permissions.
+    - **Audit events** reported by the application, and reading them back (administrators).
+    - **Per-user bookmarks.**
+    - **Health** and client error reporting.
+
+    **Authentication.** Endpoints marked with a lock need `Authorization: Bearer <Portal token>`.
+    The API validates the token against Portal (`/sharing/rest/community/self`) and caches the result
+    for 5 minutes. Portal tokens are often bound to the web app's origin: call from the app's origin,
+    or send it in `X-Client-Origin` (it must be one of the configured `APP_ORIGINS`).
+
+    **Limits.** 600 requests per minute per client IP on `/api` (standard `RateLimit` headers), JSON
+    bodies up to 256 KB. Every response carries an `X-Request-Id`; errors repeat it as `requestId`.
+
+    **Application roles** (from Portal role, privileges and groups) gate the application only; they
+    never grant ArcGIS permissions.
+  license:
+    name: Proprietary
+servers:
+  - url: /api
+    description: This server
+tags:
+  - name: System
+    description: Health and configuration
+  - name: Session
+    description: Sign-in bookkeeping and the application session
+  - name: Audit
+    description: Audit trail of application actions
+  - name: Bookmarks
+    description: Saved map views per user
+  - name: Diagnostics
+    description: Browser error reporting
+
+paths:
+  /health:
+    get:
+      tags: [System]
+      operationId: getHealth
+      summary: Liveness and ArcGIS Enterprise reachability
+      description: Checks the public ArcGIS Server `rest/info` endpoint. The check is cached for 15 seconds. No authentication.
+      security: []
+      responses:
+        "200":
+          description: The API is running. `arcgis.reachable` says whether ArcGIS Enterprise answered.
+          headers:
+            X-Request-Id: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Health" }
+              example:
+                status: ok
+                time: "2026-11-22T14:05:12.345Z"
+                arcgis: { reachable: true, version: "12.1.0", latencyMs: 112 }
+
+  /config:
+    get:
+      tags: [System]
+      operationId: getConfig
+      summary: Runtime configuration for the web client
+      description: Public, non-secret settings. The browser loads this before sign-in.
+      security: []
+      responses:
+        "200":
+          description: Configuration
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RuntimeConfig" }
+              example:
+                portalUrl: https://esrirw.rw/portal
+                serverUrl: https://esrirw.rw/server
+                oauthAppId: null
+                services:
+                  mapServer: https://esrirw.rw/server/rest/services/ParcelFabric/MapServer
+                  featureServer: https://esrirw.rw/server/rest/services/ParcelFabric/FeatureServer
+                  parcelFabricServer: https://esrirw.rw/server/rest/services/ParcelFabric/ParcelFabricServer
+                  versionManagementServer: https://esrirw.rw/server/rest/services/ParcelFabric/VersionManagementServer
+                  validationServer: https://esrirw.rw/server/rest/services/ParcelFabric/ValidationServer
+                project: { name: Kigali Parcel Fabric, dataset: kigaliParcels }
+
+  /auth/session:
+    get:
+      tags: [Session]
+      operationId: getSession
+      summary: The signed-in user, application role and permissions
+      responses:
+        "200":
+          description: The session resolved from the Portal token
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [user]
+                properties:
+                  user: { $ref: "#/components/schemas/SessionUser" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "503": { $ref: "#/components/responses/PortalUnavailable" }
+
+  /auth/signed-in:
+    post:
+      tags: [Session]
+      operationId: recordSignIn
+      summary: Record a sign-in in the audit log
+      description: Called once by the web app after sign-in. Writes an `auth.sign-in` audit event.
+      responses:
+        "204": { description: Recorded }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "503": { $ref: "#/components/responses/PortalUnavailable" }
+
+  /auth/signed-out:
+    post:
+      tags: [Session]
+      operationId: recordSignOut
+      summary: Forget a token on sign-out
+      description: Removes the token from the API's validation cache. A token is optional; without one this does nothing. Always 204.
+      security:
+        - {}
+        - bearerAuth: []
+      responses:
+        "204": { description: Done }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+
+  /audit:
+    post:
+      tags: [Audit]
+      operationId: writeAuditEvent
+      summary: Record an application action
+      description: |
+        The web app reports GIS operations here (edits, version actions, validation runs). The user,
+        role, IP and request ID are added by the server. Keys in `details` that look like credentials
+        (`token`, `password`, `secret`, `authorization`, `cookie`, `credential`) are dropped, tokens in
+        URLs are redacted, and `details` is limited to 8 KB.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AuditEventInput" }
+            example:
+              action: version.reconcile
+              outcome: success
+              target: gisa@esri_rw.Editor
+              details: { hasConflicts: false, didPost: false }
+      responses:
+        "201":
+          description: Recorded
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id]
+                properties:
+                  id: { type: string, format: uuid }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "503": { $ref: "#/components/responses/PortalUnavailable" }
+    get:
+      tags: [Audit]
+      operationId: readAuditEvents
+      summary: Read recent audit events (newest first)
+      description: Requires the `admin:audit` permission (application role Administrator).
+      parameters:
+        - name: username
+          in: query
+          description: Only events of this user (exact match)
+          schema: { type: string, maxLength: 200 }
+        - name: action
+          in: query
+          description: Only actions starting with this text, e.g. `version.` or `parcel-fabric.`
+          schema: { type: string, maxLength: 120 }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 200 }
+      responses:
+        "200":
+          description: Events, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [events]
+                properties:
+                  events:
+                    type: array
+                    items: { $ref: "#/components/schemas/AuditEvent" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "503": { $ref: "#/components/responses/PortalUnavailable" }
+
+  /client-log:
+    post:
+      tags: [Diagnostics]
+      operationId: reportClientError
+      summary: Report a browser error to the server log
+      description: The web app sends uncaught errors here (at most 10 a minute per browser, tokens scrubbed). An invalid body is ignored; the response is always 204.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [level, message]
+              properties:
+                level: { type: string, enum: [error, warn] }
+                message: { type: string, maxLength: 2000 }
+                context: { type: string, maxLength: 4000, description: "Stack trace or other context" }
+      responses:
+        "204": { description: Accepted }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+
+  /bookmarks:
+    get:
+      tags: [Bookmarks]
+      operationId: getBookmarks
+      summary: The signed-in user's bookmarks
+      description: Returns an empty list when the user has none.
+      responses:
+        "200":
+          description: Bookmarks
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BookmarkList" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "503": { $ref: "#/components/responses/PortalUnavailable" }
+    put:
+      tags: [Bookmarks]
+      operationId: saveBookmarks
+      summary: Replace the signed-in user's bookmarks
+      description: Replaces the whole list (at most 200). Thumbnails are removed before saving.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BookmarkList" }
+      responses:
+        "204": { description: Saved }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "503": { $ref: "#/components/responses/PortalUnavailable" }
+
+security:
+  - bearerAuth: []
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: ArcGIS Portal token
+      description: An ArcGIS Enterprise Portal token for the signed-in user. Never shared with other services; never logged.
+
+  headers:
+    RequestId:
+      description: Request ID; echoed from a valid incoming `X-Request-Id` (letters, digits, `.`, `_`, `-`, up to 64) or generated.
+      schema: { type: string }
+
+  responses:
+    BadRequest:
+      description: The request body or query is invalid (`invalid_json`, `invalid_audit_event`, `invalid_query`, `invalid_bookmarks`). `details` lists the problems.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example:
+            error: { code: invalid_bookmarks, message: Invalid bookmarks payload, details: [{ path: [bookmarks], message: "Too big: expected array to have <=200 items" }], requestId: 3f2b7c1e-0f7a-4c55-9a5f-2a1d9e8b7c6d }
+    Unauthorized:
+      description: No token (`auth_required`), or Portal rejected it (`invalid_token`).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example:
+            error: { code: invalid_token, message: Your ArcGIS session is invalid or has expired. Please sign in again., requestId: 3f2b7c1e-0f7a-4c55-9a5f-2a1d9e8b7c6d }
+    Forbidden:
+      description: The application role lacks a required permission (`forbidden`). `details.needed` names it.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example:
+            error: { code: forbidden, message: You do not have permission to perform this action, details: { needed: ["admin:audit"] }, requestId: 3f2b7c1e-0f7a-4c55-9a5f-2a1d9e8b7c6d }
+    TooManyRequests:
+      description: More than 600 requests in a minute from this client.
+      headers:
+        RateLimit:
+          description: Remaining quota (IETF draft-8 format)
+          schema: { type: string }
+        RateLimit-Policy:
+          schema: { type: string }
+    PortalUnavailable:
+      description: Portal could not be reached to validate the token (`portal_unavailable`).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, requestId]
+          properties:
+            code:
+              type: string
+              description: Machine-readable code
+              examples: [auth_required, invalid_token, forbidden, not_found, invalid_json, portal_unavailable, internal_error]
+            message: { type: string, description: Message suitable for users }
+            details: { description: Validation issues or other details, when available }
+            requestId: { type: string }
+
+
+    Health:
+      type: object
+      required: [status, time, arcgis]
+      properties:
+        status: { type: string, const: ok }
+        time: { type: string, format: date-time }
+        arcgis:
+          type: object
+          required: [reachable]
+          properties:
+            reachable: { type: boolean }
+            version: { type: [string, number], description: ArcGIS Server version, when reachable }
+            latencyMs: { type: integer, description: Round trip of the check, when reachable }
+
+    RuntimeConfig:
+      type: object
+      required: [portalUrl, serverUrl, oauthAppId, services, project]
+      properties:
+        portalUrl: { type: string, format: uri }
+        serverUrl: { type: string, format: uri }
+        oauthAppId: { type: [string, "null"], description: Portal OAuth app ID when configured; otherwise the SDK sign-in dialog is used }
+        services:
+          type: object
+          required: [mapServer, featureServer, parcelFabricServer, versionManagementServer, validationServer]
+          properties:
+            mapServer: { type: string, format: uri }
+            featureServer: { type: string, format: uri }
+            parcelFabricServer: { type: string, format: uri }
+            versionManagementServer: { type: string, format: uri }
+            validationServer: { type: string, format: uri }
+        project:
+          type: object
+          properties:
+            name: { type: string }
+            dataset: { type: string }
+
+    AppRole:
+      type: string
+      enum: [ADMINISTRATOR, GIS_EDITOR, SURVEYOR, VIEWER]
+
+    Permission:
+      type: string
+      enum:
+        - map:view
+        - features:edit
+        - attributes:edit
+        - parcels:edit
+        - parcels:construct
+        - records:manage
+        - versions:manage
+        - versions:post
+        - validation:run
+        - analysis:run
+        - data:export
+        - data:import
+        - admin:audit
+        - admin:forms
+
+    SessionUser:
+      type: object
+      required: [username, fullName, portalRole, privileges, appRole, permissions, canEditFeaturesInPortal]
+      properties:
+        username: { type: string, examples: [gisa@esri_rw] }
+        fullName: { type: string }
+        email: { type: string }
+        portalRole: { type: string, examples: [org_admin, org_publisher, org_user] }
+        userLicenseTypeId: { type: string, examples: [GISProfessionalAdvUT] }
+        privileges:
+          type: array
+          items: { type: string }
+        thumbnailUrl: { type: string, format: uri }
+        appRole: { $ref: "#/components/schemas/AppRole" }
+        permissions:
+          type: array
+          items: { $ref: "#/components/schemas/Permission" }
+        canEditFeaturesInPortal:
+          type: boolean
+          description: Portal grants feature editing. ArcGIS still enforces it on every edit.
+
+    AuditEventInput:
+      type: object
+      required: [action, outcome]
+      properties:
+        action:
+          type: string
+          minLength: 3
+          maxLength: 120
+          pattern: "^[a-z0-9]+(?:[.-][a-z0-9]+)*$"
+          examples: [feature.edit, version.reconcile, parcel-fabric.merge-parcels]
+        outcome: { type: string, enum: [success, failure, attempt] }
+        target: { type: string, maxLength: 500, description: What the action was on, e.g. a version name }
+        details:
+          type: object
+          additionalProperties: true
+
+    AuditEvent:
+      allOf:
+        - $ref: "#/components/schemas/AuditEventInput"
+        - type: object
+          required: [id, time, username, appRole]
+          properties:
+            id: { type: string, format: uuid }
+            time: { type: string, format: date-time }
+            username: { type: string }
+            appRole: { type: string }
+            ip: { type: string }
+            requestId: { type: string }
+
+    Bookmark:
+      type: object
+      description: An ArcGIS Maps SDK bookmark (JSON). Other properties are kept as sent.
+      additionalProperties: true
+      properties:
+        name: { type: string, maxLength: 200 }
+        extent: { type: object, additionalProperties: true }
+        viewpoint: { type: object, additionalProperties: true }
+        timeExtent: {}
+
+    BookmarkList:
+      type: object
+      required: [bookmarks]
+      properties:
+        bookmarks:
+          type: array
+          maxItems: 200
+          items: { $ref: "#/components/schemas/Bookmark" }

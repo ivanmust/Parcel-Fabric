@@ -18,6 +18,7 @@ import { layerRegistry } from "../layers/layerRegistry";
 import { ensureProjection, project, toWgs84 } from "../geometry/coordinates";
 import { describeArcGISError, describeSpatialReference } from "../../services/arcgis/serviceMetadata";
 import { selectionService } from "../selection/selectionService";
+import { useEditing } from "../../stores/editingStore";
 import { isEditorWorkflowActive } from "../editing/editorBridge";
 import { versionSession } from "../version-management/versionSession";
 import { asShownOnMap } from "../layers/query";
@@ -250,7 +251,7 @@ export class MapController {
   private async onClick(mapPoint: Point, screen: { x: number; y: number }, modifiers: { shift?: boolean; ctrl?: boolean }) {
     const tool = useApp.getState().tool;
     // While an Editor workflow is running, clicks belong to the Editor.
-    if (isEditorWorkflowActive()) return;
+    if (isEditorWorkflowActive() || useEditing.getState().manualSplit?.phase === "drawing") return;
     if (tool === "explore") await this.identify(screen);
     else if (tool === "coordinate-info") this.showCoordinateInfo(mapPoint);
     else if (tool === "select-click")
@@ -338,16 +339,25 @@ export class MapController {
     this.markerLayer.removeAll();
   }
 
-  /** Draw a dashed outline (e.g. a historic parcel that is hidden on the map) and zoom to it. */
+  /** Outline a feature (e.g. a historic parcel or a topology error) and zoom to it. */
   async showOutline(geometry: GeometryUnion) {
     this.markerLayer.removeAll();
     this.markerLayer.add(
       new Graphic({
         geometry,
-        symbol: { type: "simple-fill", color: [255, 152, 0, 0.12], outline: { color: [255, 152, 0], width: 2.5, style: "dash" } },
+        symbol:
+          geometry.type === "point" || geometry.type === "multipoint"
+            ? { type: "simple-marker", color: [255, 152, 0, 0.3], size: 16, outline: { color: [255, 152, 0], width: 2.5 } }
+            : geometry.type === "polyline"
+              ? { type: "simple-line", color: [255, 152, 0], width: 5 }
+              : { type: "simple-fill", color: [255, 152, 0, 0.12], outline: { color: [255, 152, 0], width: 2.5, style: "dash" } },
       }),
     );
-    await this.view?.goTo(geometry, { duration: 400 }).catch(ignoreInterrupt);
+    // Show some surroundings: a point, or an error a few centimetres long, would zoom in too far.
+    const extent = geometry.extent;
+    const span = extent ? Math.max(extent.width, extent.height) : 0;
+    const target = extent && span > 0 ? extent.clone().expand(Math.max(1.5, 30 / span)) : { target: geometry, scale: 500 };
+    await this.view?.goTo(target, { duration: 400 }).catch(ignoreInterrupt);
   }
 
   // ---------------------------------------------------------------- navigation

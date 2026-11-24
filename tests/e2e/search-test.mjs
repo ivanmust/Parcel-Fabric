@@ -52,10 +52,10 @@ try {
   r = await page.evaluate(async () => {
     const el = document.querySelector("arcgis-search");
     el.activeSourceIndex = 0;
-    const res = await el.search("1/02/13/02/1");
+    const res = await el.search("1/02/13/02/2");
     return res?.results?.[0]?.results?.[0]?.name ?? null;
   });
-  check("UPI: Enter on a typed UPI picks the exact match first", r === "1/02/13/02/1", String(r));
+  check("UPI: Enter on a typed UPI picks the exact match first", r === "1/02/13/02/2", String(r));
   r = await search(0, "9/99/99/99/99999");
   check("UPI: unknown UPI finds nothing", r.suggestions.length === 0 && r.result === null, JSON.stringify(r));
 

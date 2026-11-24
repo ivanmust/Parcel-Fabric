@@ -6,6 +6,8 @@ import { useApp } from "../../stores/appStore";
 import { getMapController } from "../../gis/map/MapController";
 import { useLayerRegistryVersion, useMapView } from "../../hooks/useMapController";
 import { layerRegistry } from "../../gis/layers/layerRegistry";
+import { useEditing } from "../../stores/editingStore";
+import { manualSplit } from "../../gis/parcel-fabric/manualSplit";
 import { MapContextMenu } from "./MapContextMenu";
 import { MeasurePanel } from "./MeasurePanel";
 import { createParcelSearchSources } from "../../gis/search/parcelSearch";
@@ -42,6 +44,13 @@ export function MapWorkspace() {
     view.popupEnabled = false;
   }, [view, tool]);
 
+  // Drawing a split line ends when editing stops or another map tool is chosen.
+  const splitting = useEditing((s) => s.manualSplit?.phase === "drawing");
+  const editing = useEditing((s) => s.session === "editing");
+  useEffect(() => {
+    if (splitting && (!editing || (tool !== "explore" && tool !== "pan"))) manualSplit.cancel();
+  }, [splitting, editing, tool]);
+
   const basemapSource = useMemo(() => new LocalBasemapsSource({ basemaps: ctrl.basemaps }), [ctrl]);
 
   // Two search choices: "UPI" (default) and "Name" (place or record). No world geocoder, no "All".
@@ -69,6 +78,15 @@ export function MapWorkspace() {
       <div className={`ps-map-loading ${ready ? "done" : ""}`} aria-hidden={ready}>
         <calcite-loader label="Loading map" text="Loading map…" />
       </div>
+
+      {splitting && (
+        <div id="manual-split-hint" className="ps-draw-hint" role="status">
+          <span>Click across the parcel, starting and ending on or outside its boundary. Enter or double-click to finish. Tab types a length in metres.</span>
+          <calcite-button scale="s" appearance="outline" kind="neutral" onClick={() => manualSplit.cancel()}>
+            Cancel
+          </calcite-button>
+        </div>
+      )}
 
       {view && (
         <>

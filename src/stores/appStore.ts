@@ -13,7 +13,7 @@ import type {
 } from "../types/app";
 
 const PREFS_KEY = "parcel-studio.prefs";
-const LEFT_PANELS: readonly LeftPanelId[] = ["contents", "layers", "catalog", "bookmarks", "selection", "editing"];
+const LEFT_PANELS: readonly LeftPanelId[] = ["contents", "layers", "upload", "bookmarks", "selection", "editing"];
 
 interface Prefs {
   theme: ThemeMode;

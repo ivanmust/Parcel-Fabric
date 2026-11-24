@@ -31,6 +31,9 @@ export interface SelectionSummary {
   count: number;
 }
 
+/** Manual parcel split: drawing the line, then a valid preview (part areas in m²) or why the line can't be used. */
+export type ManualSplitState = { phase: "drawing" } | { phase: "ready"; areas: number[] } | { phase: "invalid"; message: string };
+
 export type SelectionMode = "new" | "add" | "remove" | "intersect";
 
 interface EditingState {
@@ -63,8 +66,11 @@ interface EditingState {
   /** Parcel Fabric dialogs */
   mergeParcelsOpen: boolean;
   divideParcelOpen: boolean;
+  manualSplit: ManualSplitState | null;
   /** Parcels (object ids) to give UPIs; the dialog is open while this is non-empty. */
   assignUpiTargets: number[];
+  /** The parcel(s) those come from (split or merge), whose cell the new UPIs use. */
+  assignUpiFrom: number[];
 
   patch(p: Partial<EditingState>): void;
   addHistory(e: Omit<EditHistoryEntry, "id" | "time" | "version">): void;
@@ -94,7 +100,9 @@ export const useEditing = create<EditingState>((set, get) => ({
   selectByLocationOpen: false,
   mergeParcelsOpen: false,
   divideParcelOpen: false,
+  manualSplit: null,
   assignUpiTargets: [],
+  assignUpiFrom: [],
 
   patch: (p) => set(p),
   addHistory: (e) =>

@@ -274,7 +274,7 @@ Split and merge on parcels were plain polygon edits, which lose the fabric's his
   - New parcels are created by the record.
   - The dialogs open from the toolbar's Merge and Split when parcels are selected.
   - The Editor's own split and merge buttons are hidden, so parcels can't be split or merged without lineage.
-- **Validate** (`ValidationServer/evaluate`, `topologyRules`) for the current map view, plus a count of dirty areas and point, line and polygon errors.
+- **Validate** (`ValidationServer/evaluate`, `topologyRules`) for the current map view, plus a count of dirty areas and point, line and polygon errors. *Correction (§R): this never validated anything until 2026-11-22; the "verified" statements about validation in §M to §Q were wrong.*
 - **Parcel lineage** in the properties panel: current or historic status, the creating and retiring records, and the overlapping parcels before and after. Historic parcels are outlined on the map on request.
 - **Historic parcels hidden on the map:** current parcels and lines only (`retiredbyrecord IS NULL`).
   - The filter is applied to drawing and to every app query (`asShownOnMap`); lineage queries the service directly.
@@ -390,3 +390,36 @@ The goal was a cleaner codebase with every feature, workflow and screen unchange
 - **Logging:** a request refused on purpose by the UPI guard (`request:interceptor`) is no longer logged twice as a runtime error; the user still sees the message in the app and in the Editor.
 
 Verified: typecheck, lint and build pass; live suites workspace pass, versions and selection 18/18, search 13/13, editing 44/44, Editor tools 25/25. No test versions left; DEFAULT unchanged (4,743 parcels, 41,636 lines). A snapshot of the code before the refactor is kept outside the project for rollback.
+
+## R. Shapefile upload, manual split, Validate fixed (2026-11-22)
+
+**Bugs found and fixed**
+- **Validate never validated.** The area was sent in Web Mercator; ValidationServer answers `success: true` and does nothing. It is now sent in the data's coordinate system, and a missing `validatedArea` over dirty areas is reported. On DEFAULT's data this takes dirty areas 1 to 0 and errors 2 to 11. The old test only looked for words on screen.
+- **Active record.** Every record change after the first in a session threw while stamping the Points layer's templates, so Plot and Plot_Lines kept stamping the first record on drawn features. Merge and divide were not affected (they read the active record directly).
+
+**New**
+- **Upload Shapefile** replaces Catalog (`utils/shapefile.ts`, `gis/layers/shapefileLayer.ts`): browser only, read-only, snappable. No packages added.
+- **Manual split** (`gis/parcel-fabric/manualSplit.ts`, `parcelFabricService.splitOff`): add the part, `clip` (DiscardArea), `build` limited to the record and the parcel's extent, then clear the UPI, number and areas the remainder copied. The server refuses the `clippingGeometry` form of clip.
+- **Check errors** works without editing, names each error's rule and zooms to it.
+
+**Posts to DEFAULT, from the audit log (corrects earlier "tests never post" statements)**
+- 2026-11-19 15:00Z: posted by a Claude test (empty version, no edits). The remaining role test can no longer post.
+- 2026-11-20 07:42, 07:53, 07:57Z and 2026-11-22 17:09Z: posted from the app as gisa@esri_rw, with no Claude activity at those times. The last retired 1/02/13/02/1 into 3871 and 3872 (4,743 to 4,744 current parcels) under record Remera_Rukiri I_Izuba_2026-11-18, although the parcel is in Nyarutarama cell.
+
+**Open, for the owner to decide**
+- Whether that post and its record are intended.
+- Records of drawn parcels 6520 and 8424 (possible effect of the active-record bug).
+- UPI suggester: picks the most common nearby cell, which is the wrong cell for 56 of 4,744 parcels (1.2%); Kamukina (1/02/08/01) suggests 18374 because of outliers 18370 to 18373 (the main series ends near 1916, with 12440 and 13680 also outliers); numbers are not reserved, so two versions can get the same UPI. The National Land Authority is the issuer of official UPIs.
+- The published technical review and its PDF still describe validation as working.
+- This PC's clock is about 5 minutes ahead of the ArcGIS server's.
+
+## S. UPI suggestion, stage 1 of 3 (2026-11-23)
+
+The suggestion follows the application's own rule (`gis/parcel-fabric/upi.ts`, `suggestUpis`); official issuing by the NLA is to be discussed.
+- **Cell:** from the parcel(s) the new ones come from. A merge across cells is blocked until the editor chooses the cell. Without a parent, from the parcel's own cell name (the UPI prefix most used with that name). Only then from neighbours, and the dialog says so. The neighbour rule was wrong for 56 of 4,744 parcels.
+- **Number:** next free after the highest used in the cell, current and historic, as before.
+- **Warning:** numbers above 1.5 times the cell's 99th percentile (and more than 100 above it) are listed, e.g. Kamukina: series up to about 1,908, with 13680 and 18370 to 18373 above it. The suggestion is not changed; the data owner decides.
+- **Location fields:** from the parent(s); empty ones from the same cell's parcels around, else the whole cell.
+- Verified live (throw-away versions): split 36/36 (split suite), editing 44/44, Editor tools 25/25.
+
+Stage 2 (numbers issued by the geodatabase) and stage 3 (official UPI from the NLA, provisional IDs before) are not started.

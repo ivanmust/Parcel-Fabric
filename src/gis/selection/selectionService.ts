@@ -4,6 +4,10 @@ import type MapView from "@arcgis/core/views/MapView.js";
 import type FeatureLayer from "@arcgis/core/layers/FeatureLayer.js";
 import type { GeometryUnion } from "@arcgis/core/unionTypes.js";
 import * as unionOperator from "@arcgis/core/geometry/operators/unionOperator.js";
+import Multipoint from "@arcgis/core/geometry/Multipoint.js";
+import type Point from "@arcgis/core/geometry/Point.js";
+import Polygon from "@arcgis/core/geometry/Polygon.js";
+import Polyline from "@arcgis/core/geometry/Polyline.js";
 import { layerRegistry, type ServiceLayerInfo } from "../layers/layerRegistry";
 import { getMapController } from "../map/MapController";
 import { useEditing, type SelectionMode } from "../../stores/editingStore";
@@ -12,9 +16,29 @@ import { describeArcGISError } from "../../services/arcgis/serviceMetadata";
 import { asShownOnMap } from "../layers/query";
 
 export type DrawTool = "rectangle" | "polygon" | "lasso";
+/** Which source features define the location: those selected, or all of them in the current map view. */
+export type SourceScope = "selected" | "view";
 export type SpatialRelation = "intersects" | "contains" | "within" | "touches" | "crosses" | "overlaps" | "envelope-intersects";
 
-const MAX_SOURCE_FEATURES = 2000;
+/** Source features are combined in the browser and sent as one query shape; above this the map view is too large. */
+const MAX_SOURCE_FEATURES = 10000;
+/** Below the service's maxRecordCount (2,000), so no request is cut short. */
+const SOURCE_BATCH = 1000;
+/** Source shapes sent together in one query when they don't need to be merged. */
+const QUERY_BATCH = 200;
+const PARALLEL_QUERIES = 4;
+/** Relationships a target has with a set of shapes exactly when it has them with at least one of them. */
+const PER_SHAPE: readonly SpatialRelation[] = ["intersects", "envelope-intersects"];
+
+/** Shapes of one kind as a single multi-part geometry, unchanged (no merging of their boundaries). */
+function asOneGeometry(shapes: GeometryUnion[]): GeometryUnion {
+  const [first] = shapes;
+  const spatialReference = first!.spatialReference;
+  if (first!.type === "polygon") return new Polygon({ rings: shapes.flatMap((g) => (g as Polygon).rings), spatialReference });
+  if (first!.type === "polyline") return new Polyline({ paths: shapes.flatMap((g) => (g as Polyline).paths), spatialReference });
+  if (first!.type === "point") return new Multipoint({ points: shapes.map((g) => [(g as Point).x, (g as Point).y]), spatialReference });
+  return new Multipoint({ points: shapes.flatMap((g) => (g as Multipoint).points), spatialReference });
+}
 
 
 class SelectionService {
@@ -143,8 +167,8 @@ class SelectionService {
   }
 
   /**
-   * Select features of `target` by their spatial relationship to the selected
-   * features of `source` (optionally buffered by `distance` metres).
+   * Select features of `target` by their spatial relationship to features of `source`: its selected
+   * features, or all of its features in the current map view (optionally buffered by `distance` metres).
    */
   async selectByLocation(
     target: ServiceLayerInfo,
@@ -152,26 +176,55 @@ class SelectionService {
     relation: SpatialRelation,
     distance: number,
     mode: SelectionMode,
+    scope: SourceScope = "selected",
   ): Promise<number> {
     const view = this.view();
-    const ids = (view.selectionManager.getSelection(source.layer) ?? []) as number[];
-    if (!ids.length) throw new Error(`Select features in "${source.name}" first – they are used as the location source.`);
+    const ids =
+      scope === "selected"
+        ? ((view.selectionManager.getSelection(source.layer) ?? []) as number[])
+        : ((await source.layer.queryObjectIds(asShownOnMap(source.layer, { geometry: view.extent, where: "1=1" }))) as number[]);
+    if (!ids.length)
+      throw new Error(scope === "selected" ? `No features are selected in "${source.name}".` : `"${source.name}" has no features in this map view.`);
     if (ids.length > MAX_SOURCE_FEATURES)
-      throw new Error(`Use at most ${MAX_SOURCE_FEATURES} source features (you selected ${ids.length}).`);
-    const fs = await source.layer.queryFeatures(asShownOnMap(source.layer, { objectIds: ids, returnGeometry: true, outFields: [] }));
-    const geoms = fs.features.map((f) => f.geometry).filter((g): g is GeometryUnion => !!g);
+      throw new Error(
+        scope === "selected"
+          ? `Use at most ${MAX_SOURCE_FEATURES} source features (you selected ${ids.length}).`
+          : `"${source.name}" has ${ids.length.toLocaleString("en-US")} features in this view; the limit is ${MAX_SOURCE_FEATURES}. Zoom in or select the source features.`,
+      );
+    const geoms: GeometryUnion[] = [];
+    for (let i = 0; i < ids.length; i += SOURCE_BATCH) {
+      const fs = await source.layer.queryFeatures(asShownOnMap(source.layer, { objectIds: ids.slice(i, i + SOURCE_BATCH), returnGeometry: true, outFields: [] }));
+      for (const f of fs.features) if (f.geometry) geoms.push(f.geometry as GeometryUnion);
+    }
     if (!geoms.length) throw new Error("The selected source features have no geometry.");
-    const geometry = geoms.length === 1 ? geoms[0]! : (unionOperator.executeMany(geoms as never) as GeometryUnion | null);
-    if (!geometry) throw new Error("Could not combine the source geometries.");
-    const result = (await target.layer.queryObjectIds(
-      asShownOnMap(target.layer, {
-        geometry,
-        spatialRelationship: relation,
-        distance: distance > 0 ? distance : undefined,
-        units: distance > 0 ? ("meters" as const) : undefined,
-        where: "1=1",
-      }),
-    )) as number[];
+    const query = (geometry: GeometryUnion) =>
+      target.layer.queryObjectIds(
+        asShownOnMap(target.layer, {
+          geometry,
+          spatialRelationship: relation,
+          distance: distance > 0 ? distance : undefined,
+          units: distance > 0 ? ("meters" as const) : undefined,
+          where: "1=1",
+        }),
+      ) as Promise<number[]>;
+
+    let result: number[];
+    if (PER_SHAPE.includes(relation)) {
+      // Exact: the source shapes are sent as they are, in batches. Merging them first moves shared
+      // boundaries slightly and loses targets that lie exactly on an edge (fabric points do).
+      const batches: GeometryUnion[][] = [];
+      for (let i = 0; i < geoms.length; i += QUERY_BATCH) batches.push(geoms.slice(i, i + QUERY_BATCH));
+      const found = new Set<number>();
+      // A few requests at a time: faster than one by one, without flooding the server.
+      for (let i = 0; i < batches.length; i += PARALLEL_QUERIES)
+        for (const ids of await Promise.all(batches.slice(i, i + PARALLEL_QUERIES).map((b) => query(asOneGeometry(b))))) for (const id of ids) found.add(id);
+      result = [...found];
+    } else {
+      // within / contains / touches / crosses / overlaps are about the sources as one shape.
+      const geometry = geoms.length === 1 ? geoms[0]! : (unionOperator.executeMany(geoms as never) as GeometryUnion | null);
+      if (!geometry) throw new Error("Could not combine the source geometries.");
+      result = await query(geometry);
+    }
     this.apply(target.layer, result, mode);
     this.report(mode, result.length, target.name);
     return result.length;

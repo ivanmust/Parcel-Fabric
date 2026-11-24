@@ -66,7 +66,7 @@ export type MapTool =
   | "select-polygon"
   | "select-lasso";
 
-export type LeftPanelId = "contents" | "layers" | "catalog" | "bookmarks" | "selection" | "editing";
+export type LeftPanelId = "contents" | "layers" | "upload" | "bookmarks" | "selection" | "editing";
 export type BottomTabId = "table" | "history" | "messages" | "logs";
 
 export type LogLevel = "debug" | "info" | "success" | "warning" | "error";

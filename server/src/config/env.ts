@@ -26,6 +26,8 @@ const EnvSchema = z.object({
   ROLE_GROUP_SURVEYOR: z.string().default(""),
   AUDIT_DIR: z.string().default("data/audit"),
   BOOKMARKS_DIR: z.string().default("data/bookmarks"),
+  /** Serve the OpenAPI description and Swagger UI at /api/docs. Default: on, except in production. */
+  API_DOCS: z.enum(["true", "false"]).optional(),
 });
 
 export type AppConfig = z.infer<typeof EnvSchema> & {

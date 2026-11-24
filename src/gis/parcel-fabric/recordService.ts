@@ -101,21 +101,21 @@ export const recordService = {
   },
 };
 
-/** Write the active record into each feature template prototype of a layer. */
+/**
+ * Write the active record into each feature template prototype of a layer. The SDK's own template and
+ * type objects are updated: rebuilding them from toJSON() left plain-object domains, so the next record
+ * change threw part-way and the parcel layers went on stamping the previous record.
+ */
 function applyToTemplates(layer: FeatureLayer, guid: string | null) {
-  const stamp = (tpl: { prototype?: { attributes?: Record<string, unknown> } }) => {
-    tpl.prototype ??= {};
-    tpl.prototype.attributes ??= {};
-    tpl.prototype.attributes[CREATED_BY_RECORD] = guid;
-    return tpl;
+  const stamp = <T extends { prototype?: unknown }>(template: T): T => {
+    const prototype = (template.prototype ?? {}) as { attributes?: Record<string, unknown> };
+    template.prototype = { ...prototype, attributes: { ...prototype.attributes, [CREATED_BY_RECORD]: guid } };
+    return template;
   };
-  if (layer.templates?.length) layer.templates = layer.templates.map((t) => stamp(t.toJSON()));
+  if (layer.templates?.length) layer.templates = layer.templates.map(stamp);
   if (layer.types?.length) {
-    layer.types = layer.types.map((type) => {
-      const j = type.toJSON();
-      j.templates = (j.templates ?? []).map(stamp);
-      return j;
-    });
+    for (const type of layer.types) if (type.templates?.length) type.templates = type.templates.map(stamp);
+    layer.types = [...layer.types];
   }
 }
 

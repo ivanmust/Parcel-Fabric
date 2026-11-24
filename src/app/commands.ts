@@ -6,6 +6,7 @@ import { selectionService } from "../gis/selection/selectionService";
 import { editorBridge, isEditorWorkflowActive } from "../gis/editing/editorBridge";
 import type { MapTool } from "../types/app";
 import { parcelFabricService } from "../gis/parcel-fabric/parcelFabricService";
+import { manualSplit } from "../gis/parcel-fabric/manualSplit";
 
 const onlyParcelsSelected = (selection: { layerKey: string }[]) =>
   selection.length === 1 && parcelFabricService.isParcelLayer(selection[0]!.layerKey);
@@ -145,6 +146,7 @@ export function runCommand(id: string): void {
       }
       app.setTool("explore");
       selectionService.cancelDraw();
+      if (manualSplit.drawing) manualSplit.cancel();
       ctrl.clearHighlight();
       ctrl.clearMarkers();
       app.showProperties({ kind: "none" });

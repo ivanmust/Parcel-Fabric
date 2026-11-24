@@ -47,10 +47,15 @@ No database credentials are used. All GIS access goes through ArcGIS Enterprise 
 
 ```powershell
 npm run typecheck; npm --prefix server run typecheck
+npm run test:unit              # Shapefile reader (no server needed)
 npm run lint                   # ESLint for the web app, server and tests
 ```
 
 Live end-to-end tests (they need both dev servers and work only in throw-away versions): see [tests/e2e/README.md](tests/e2e/README.md).
+
+## API documentation
+
+The backend API is described in [server/openapi.yaml](server/openapi.yaml) (OpenAPI 3.1). With the dev servers running, browse it in Swagger UI at http://localhost:5174/api/docs (or http://localhost:4001/api/docs). **Authorize** takes a Portal token to try the protected endpoints. The docs are on by default except in production; set `API_DOCS=true` or `false` in `server/.env` to override. Keep the file in step with `server/src/routes/` when routes change.
 
 ## Project layout
 
@@ -101,10 +106,11 @@ Press `?` in the app for the full list.
 4. Edit:
    - create from templates with the Editor;
    - modify, move, rotate, scale and reshape vertices;
-   - **parcels:** Split (`Shift+S`) opens **Divide** and Merge (`Shift+G`) opens **Merge**. These are Parcel Fabric operations: the original parcels are retired by the active record and kept as history (see *Parcel lineage* in the properties panel). Other layers use the Editor's split and merge;
+   - **parcels:** Split (`Shift+S`) opens **Divide** (by area or width, or **Draw the line manually**: draw across the parcel, preview both areas, then split) and Merge (`Shift+G`) opens **Merge**. These are Parcel Fabric operations: the original parcels are retired by the active record and kept as history (see *Parcel lineage* in the properties panel). Other layers use the Editor's split and merge;
    - **Delete** on parcels offers **Retire (keep history)**, the normal case, which sets them historic with the active record, or **Delete permanently**, for mistakes, which also removes their unused lines and points;
-   - **UPIs:** after a divide, **Assign UPIs** opens with suggestions: the next free numbers in the cell, checked against all parcels including historic ones. It also fills the parcel number and any empty location fields. Merge suggests the new UPI the same way. **Assign UPIs** in Editing Tools → Parcel Fabric finds parcels in the map view without a valid UPI. A UPI typed in the attribute form or table follows the same rules: a new or changed UPI that is badly formatted or already used by another parcel is refused before anything is sent (an empty UPI is allowed; existing UPIs that are not changed are not checked);
-   - **Validate this map view** (Editing Tools → Parcel Fabric) checks the topology rules and lists dirty areas and errors;
+   - **UPIs:** after a split, **Assign UPIs** opens with suggestions. The cell comes from the parcel that was split (a merge across cells asks which cell; a parcel with no parent uses its cell name; neighbours only as a last resort, and the dialog says which). The number is the next free one after the highest used in that cell, historic parcels included. A warning shows when a few unusually high numbers push it up. This is the application's own rule, not an official NLA rule. It also fills the parcel number and any empty location fields. Merge suggests the new UPI the same way. **Assign UPIs** in Editing Tools → Parcel Fabric finds parcels in the map view without a valid UPI. A UPI typed in the attribute form or table follows the same rules: a new or changed UPI that is badly formatted or already used by another parcel is refused before anything is sent (an empty UPI is allowed; existing UPIs that are not changed are not checked);
+   - **Validate this map view** (Editing Tools → Parcel Fabric, while editing a named version) checks the topology rules. **Check errors** works without editing. Both list errors by rule; click one to zoom to it;
+   - **Upload Shapefile** (left bar) shows a .zip or .shp/.dbf/.prj on the map for reference and snapping. It stays in the browser and is never written to ArcGIS;
    - edit attributes, including batch edits, in the form or the attribute table.
 
    Snapping and direction/distance input are available while drawing.

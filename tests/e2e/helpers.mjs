@@ -196,7 +196,12 @@ export async function createVersionViaUI(page, tools, name) {
 /** Create a parcel record in the Editing panel and make it the active record. */
 export async function createActiveRecord(page, tools, name) {
   const { deepClick, waitFor, state } = tools;
-  await page.evaluate(() => window.__ps.app.getState().openLeftPanel("editing"));
+  // openLeftPanel toggles; set it open instead, in case the panel is already showing.
+  await page.evaluate(() => {
+    const app = window.__ps.app.getState();
+    app.setPref("leftPanel", "editing");
+    app.setPref("leftOpen", true);
+  });
   await sleep(2000);
   await deepClick("New record", { scope: ".ps-side.left", tags: ["CALCITE-BUTTON"] });
   await sleep(500);
