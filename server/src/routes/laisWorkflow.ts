@@ -89,7 +89,7 @@ laisWorkflow.post("/:objectId/version", requireAuth, requirePermission("versions
     const query = await arcgisPost(
       `${url}/query`,
       {
-        where: `OBJECTID = ${objectId.data}`,
+        objectIds: String(objectId.data),
         outFields: "*",
         returnGeometry: "false",
       },
