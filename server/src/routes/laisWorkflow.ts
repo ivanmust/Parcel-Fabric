@@ -100,11 +100,14 @@ laisWorkflow.post("/:objectId/version", requireAuth, requirePermission("versions
     const attributes = feature?.attributes;
     if (!attributes) throw new HttpError(404, "LAIS transaction was not found.", "lais_transaction_not_found");
     if (attributes.case !== "Yes") throw new HttpError(409, "Only validated transactions (case = Yes) can be linked to a version.", "lais_transaction_not_validated");
-    if (attributes.version_status === "Created" && attributes.version_name === body.data.versionName) {
+    if (attributes.version_status === "Created") {
+      if (attributes.version_name !== body.data.versionName) {
+        throw new HttpError(409, "This transaction is already linked to a different version.", "lais_transaction_already_linked");
+      }
       res.json({ success: true, versionName: body.data.versionName, alreadyRecorded: true });
       return;
     }
-    if (attributes.version_status !== "Pending" && attributes.version_status !== "Created") {
+    if (attributes.version_status !== "Pending") {
       throw new HttpError(409, "This transaction is not pending version generation.", "lais_transaction_not_pending");
     }
 
