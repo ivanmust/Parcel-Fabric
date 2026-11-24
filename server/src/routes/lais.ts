@@ -88,6 +88,26 @@ async function queryCount(url: string, where: string, token: string): Promise<nu
 const UPI_PATTERN = /^\d\/\d{2}\/\d{2}\/\d{2}\/\d+$/;
 const ISO_WITH_ZONE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?(?:Z|[+-]\d{2}:\d{2})$/;
 
+function isValidTransactionDate(value: string): boolean {
+  if (!ISO_WITH_ZONE.test(value) || Number.isNaN(Date.parse(value))) return false;
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?(Z|[+-](\d{2}):(\d{2}))$/.exec(value);
+  if (!match) return false;
+  const [, y, mo, d, h, mi, sec = "0", fraction = "0", zone, zoneHour = "0", zoneMinute = "0"] = match;
+  const year = Number(y), month = Number(mo), day = Number(d);
+  const hour = Number(h), minute = Number(mi), second = Number(sec);
+  const millis = Number(fraction.padEnd(3, "0"));
+  const local = new Date(Date.UTC(year, month - 1, day, hour, minute, second, millis));
+  if (
+    local.getUTCFullYear() !== year || local.getUTCMonth() !== month - 1 || local.getUTCDate() !== day ||
+    hour > 23 || minute > 59 || second > 59
+  ) return false;
+  if (zone !== "Z") {
+    const offsetHour = Number(zoneHour), offsetMinute = Number(zoneMinute);
+    if (offsetHour > 14 || offsetMinute > 59 || (offsetHour === 14 && offsetMinute !== 0)) return false;
+  }
+  return true;
+}
+
 /**
  * LAIS transaction intake.
  *
