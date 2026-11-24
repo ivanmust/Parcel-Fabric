@@ -34,7 +34,7 @@ function sameSecret(received: string | undefined, expected: string): boolean {
 
 /** Dedicated LAIS authentication; never accepts or reuses a browser Portal token. */
 lais.use((req, _res, next) => {
-  if (!config.LAIS_API_KEY || !sameSecret(req.header("x-api-key"), config.LAIS_API_KEY)) {
+  if (config.LAIS_API_KEY.length < 32 || !sameSecret(req.header("x-api-key"), config.LAIS_API_KEY)) {
     throw new HttpError(401, "Valid LAIS API credentials are required", "lais_unauthorized");
   }
   next();
