@@ -193,8 +193,7 @@ lais.post("/transactions", async (req, res) => {
     });
   } catch (error) {
     // Avoid returning ArcGIS internals, credentials or service details to LAIS.
-    throw new HttpError(502, "GIS could not validate or record the transaction. Contact the GIS integration administrator.", "lais_gis_unavailable", {
-      reason: error instanceof Error ? error.message : "Unknown GIS integration error",
-    });
+    // Detailed ArcGIS errors remain in the server log; do not disclose service internals to LAIS.
+    throw new HttpError(502, "GIS could not validate or record the transaction. Contact the GIS integration administrator.", "lais_gis_unavailable");
   }
 });
