@@ -26,6 +26,14 @@ const EnvSchema = z.object({
   ROLE_GROUP_SURVEYOR: z.string().default(""),
   AUDIT_DIR: z.string().default("data/audit"),
   BOOKMARKS_DIR: z.string().default("data/bookmarks"),
+  // LAIS-to-GIS integration. Empty defaults keep the endpoint disabled until configured.
+  LAIS_API_KEY: z.string().default(""),
+  LAIS_ARCGIS_USERNAME: z.string().default(""),
+  LAIS_ARCGIS_PASSWORD: z.string().default(""),
+  LAIS_ARCGIS_REFERER: z.url().default("http://localhost:5174"),
+  LAIS_PARCEL_LAYER_URL: z.string().default(""),
+  LAIS_TRANSACTION_TABLE_URL: z.string().default(""),
+  LAIS_ALLOWED_STATUSES: csv,
   /** Serve the OpenAPI description and Swagger UI at /api/docs. Default: on, except in production. */
   API_DOCS: z.enum(["true", "false"]).optional(),
 });
