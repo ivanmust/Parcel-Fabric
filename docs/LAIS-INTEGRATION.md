@@ -100,9 +100,16 @@ Validation success response (HTTP 201):
 
 A failed validation is returned with `case: "No"`; it must never create a version. Whether rejected attempts themselves should also be persisted as table rows is a separate audit-retention decision and must not be assumed, because some submitted fields may be missing or invalid.
 
-### Read eligible transactions
+### Web editing application: generate and record a version
 
-The web application needs a Portal-authenticated endpoint to list or retrieve records where `case = "Yes"` and `version_status = "Pending"`. The application then creates the version using the existing `versionSession.createVersion(name, access, description)` method and updates the transaction row with the created version name/status. LAIS credentials must not be used to create ArcGIS versions.
+The implementation adds these Portal-authenticated workflow endpoints:
+
+- `GET /api/lais-workflow/pending` — requires `versions:manage`; returns rows where `case = "Yes"` and `version_status = "Pending"`.
+- `POST /api/lais-workflow/{objectId}/version` — requires `versions:manage`; verifies that the row is validated and pending, then records `version_name` and sets `version_status = "Created"`. It does not create the ArcGIS version itself.
+
+In the existing Version Manager, an authorized editor opens **LAIS transactions**. For each pending record, the app creates a private named version using the existing `versionSession.createVersion(name, access, description)` method and the signed-in user's VersionManagementService session. It then calls the second endpoint to record the version. The version name is deterministic from the LAIS Transaction_ID, so if version creation succeeds but the table update fails, retrying finds the existing version instead of creating a duplicate.
+
+The app does not automatically switch the editor's active version; the user can select the new version in Version Manager. LAIS credentials are never used for version creation. The transaction table must be shared with authorized editors with query and update privileges, and its `version_name` and `version_status` fields must exist.
 
 ## Configuration and deployment gates
 
