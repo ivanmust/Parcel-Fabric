@@ -112,7 +112,7 @@ lais.post("/transactions", async (req, res) => {
   if (!UPI_PATTERN.test(input.UPI)) {
     errors.push({ field: "UPI", code: "INVALID_UPI_FORMAT", message: "UPI must follow province/district/sector/cell/number, for example 1/02/13/02/1001." });
   }
-  if (!ISO_WITH_ZONE.test(input.Transaction_Date) || Number.isNaN(Date.parse(input.Transaction_Date))) {
+  if (!isValidTransactionDate(input.Transaction_Date)) {
     errors.push({ field: "Transaction_Date", code: "INVALID_DATE", message: "Use an ISO 8601 date-time with an explicit timezone, for example 2026-11-24T08:30:00+02:00." });
   }
   if (config.LAIS_ALLOWED_STATUSES.length && !config.LAIS_ALLOWED_STATUSES.includes(input.Transaction_Status)) {
