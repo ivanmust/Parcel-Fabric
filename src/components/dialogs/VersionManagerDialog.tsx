@@ -5,6 +5,7 @@ import { useApp, hasPermission } from "../../stores/appStore";
 import { versionSession } from "../../gis/version-management/versionSession";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { calciteInput } from "../../utils/calciteInput";
+import { LaisTransactionsDialog } from "./LaisTransactionsDialog";
 
 const fmt = (t?: number) => (t ? new Date(t).toLocaleString("en-GB") : "—");
 
@@ -29,6 +30,7 @@ export function VersionManagerDialog() {
   const [error, setError] = useState<string | null>(null);
   const [form, setForm] = useState({ name: "", access: "private" as "private" | "protected" | "public", description: "" });
   const [showCreate, setShowCreate] = useState(false);
+  const [laisOpen, setLaisOpen] = useState(false);
   const [confirm, setConfirm] = useState<Pending>(null);
   const [conflictDetection, setConflictDetection] = useState<"by-object" | "by-attribute">("by-object");
   const notify = useApp.getState().notify;
@@ -94,6 +96,11 @@ export function VersionManagerDialog() {
           <div className="ps-row space" style={{ marginBottom: 8 }}>
             <strong>Versions ({versions.length})</strong>
             <div className="ps-row">
+              {canManage && (
+                <calcite-button scale="s" appearance="outline" icon-start="organization" onClick={() => setLaisOpen(true)}>
+                  LAIS transactions
+                </calcite-button>
+              )}
               <calcite-button scale="s" appearance="transparent" icon-start="refresh" loading={loading || undefined} onClick={() => void versionSession.refreshVersions()}>
                 Refresh
               </calcite-button>
@@ -260,6 +267,7 @@ export function VersionManagerDialog() {
         </section>
       </div>
 
+      <LaisTransactionsDialog open={laisOpen} onClose={() => setLaisOpen(false)} />
       <ConfirmDialog
         open={confirm?.kind === "delete"}
         title="Delete version?"
