@@ -213,6 +213,7 @@ lais.post("/transactions", async (req, res) => {
           Transaction_Date: Date.parse(input.Transaction_Date),
           case: "Yes",
           validation_message: "Validated",
+          created_at: Date.now(),
           version_status: "Pending",
         },
       }]),
