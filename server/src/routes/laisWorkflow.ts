@@ -48,7 +48,7 @@ laisWorkflow.get("/pending", requireAuth, requirePermission("versions:manage"), 
     const body = await arcgisPost(
       `${tableUrl()}/query`,
       {
-        where: "case = 'Yes' AND version_status = 'Pending'",
+        where: `"case" = 'Yes' AND version_status = 'Pending'`,
         outFields: "*",
         returnGeometry: "false",
         orderByFields: "Transaction_Date ASC",
