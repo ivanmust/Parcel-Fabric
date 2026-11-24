@@ -108,7 +108,7 @@ export function LaisTransactionsDialog({ open, onClose }: { open: boolean; onClo
       description="Only transactions validated by the LAIS integration API (case = Yes) appear here."
       oncalciteDialogClose={onClose}
     >
-      <div style={{ minWidth: 520, maxWidth: 760 }}>
+      <div style={{ width: "min(100%, 760px)" }}>
         <div className="ps-row space" style={{ marginBottom: 12 }}>
           <strong>{transactions.length} pending transaction(s)</strong>
           <calcite-button scale="s" appearance="outline" icon-start="refresh" loading={loading || undefined} disabled={loading || !!workingId || undefined} onClick={() => void load()}>
@@ -145,16 +145,13 @@ export function LaisTransactionsDialog({ open, onClose }: { open: boolean; onClo
                   description={`UPI: ${a.UPI ?? "—"} · ${a.Transaction_Status ?? "—"} · ${formatDate(a.Transaction_Date)}`}
                 >
                   <calcite-chip slot="content-end" kind="success" scale="s">Validated</calcite-chip>
-                  <calcite-button
+                  <calcite-action
                     slot="actions-end"
-                    scale="s"
-                    icon-start="code-branch"
-                    loading={workingId === transaction.objectId || undefined}
+                    icon="code-branch"
+                    text={workingId === transaction.objectId ? "Generating version" : "Generate version"}
                     disabled={!!workingId || loading || undefined}
                     onClick={() => void createVersion(transaction)}
-                  >
-                    Generate version
-                  </calcite-button>
+                  />
                 </calcite-list-item>
               );
             })}
