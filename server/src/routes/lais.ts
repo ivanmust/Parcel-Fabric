@@ -3,6 +3,7 @@ import { Router } from "express";
 import { z } from "zod";
 import { config } from "../config/env.js";
 import { HttpError } from "../utils/httpError.js";
+import { logger } from "../logging/logger.js";
 
 export const lais = Router();
 
@@ -192,8 +193,8 @@ lais.post("/transactions", async (req, res) => {
       },
     });
   } catch (error) {
-    // Avoid returning ArcGIS internals, credentials or service details to LAIS.
-    // Detailed ArcGIS errors remain in the server log; do not disclose service internals to LAIS.
+    // Keep detailed causes in server logs only; never disclose Portal/service internals to LAIS.
+    logger.error({ err: error, transactionId: input.Transaction_ID }, "LAIS transaction GIS operation failed");
     throw new HttpError(502, "GIS could not validate or record the transaction. Contact the GIS integration administrator.", "lais_gis_unavailable");
   }
 });
