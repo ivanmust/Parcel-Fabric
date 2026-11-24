@@ -146,14 +146,36 @@ lais.post("/transactions", async (req, res) => {
       return;
     }
 
-    const existing = await queryCount(
-      config.LAIS_TRANSACTION_TABLE_URL,
-      `Transaction_ID = ${sqlString(input.Transaction_ID)}`,
+    const existing = await arcgisPost(`${config.LAIS_TRANSACTION_TABLE_URL}/query`, {
+      f: "json",
       token,
-    );
-    if (existing > 0) {
+      where: `Transaction_ID = ${sqlString(input.Transaction_ID)}`,
+      outFields: "UPI,Transaction_ID,Transaction_Status,Transaction_Date,case,version_status",
+      returnGeometry: "false",
+    });
+    const existingRecord = existing.features?.[0]?.attributes;
+    if (existingRecord) {
+      const samePayload =
+        existingRecord.UPI === input.UPI &&
+        existingRecord.Transaction_Status === input.Transaction_Status &&
+        Number(existingRecord.Transaction_Date) === Date.parse(input.Transaction_Date);
+      if (samePayload && existingRecord.case === "Yes") {
+        res.status(200).json({
+          success: true,
+          case: "Yes",
+          message: "This transaction was already validated and recorded.",
+          data: {
+            ...input,
+            Transaction_Date: new Date(Date.parse(input.Transaction_Date)).toISOString(),
+            case: "Yes",
+            version_status: String(existingRecord.version_status ?? "Pending"),
+            duplicate: true,
+          },
+        });
+        return;
+      }
       res.status(409).json({
-        success: false, case: "No", message: "Transaction_ID has already been recorded.",
+        success: false, case: "No", message: "Transaction_ID has already been used for a different payload.",
         errors: [{ field: "Transaction_ID", code: "DUPLICATE_TRANSACTION_ID", message: "Use a new Transaction_ID. Existing records are not overwritten." }],
       });
       return;
