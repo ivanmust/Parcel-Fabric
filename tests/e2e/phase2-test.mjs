@@ -6,6 +6,8 @@ const out = process.argv[2] || (await import("node:os")).tmpdir();
 const TS = new Date().toISOString().replace(/\D/g, "").slice(4, 12);
 const VERSION = `PS_E2E_${TS}`;
 const RECORD = `E2E-REC-${TS}`;
+// A record holds one kind of operation: the subdivision's record can't also merge.
+const RECORD_MERGE = `E2E-MRG-${TS}`;
 const results = [];
 const check = (name, ok, detail = "") => {
   results.push(`${ok ? "PASS" : "FAIL"}  ${name}${detail ? `  — ${detail}` : ""}`);
@@ -309,11 +311,40 @@ try {
   check("Divide: 3 new current parcels", afterDivide.length === 3, `current parcels by record: ${afterDivide.length}`);
   check("Divide: original parcel retired by the record and kept as history", origLineage.historic && origLineage.retiredBy === RECORD && origLineage.successors === 3, JSON.stringify(origLineage));
 
+  // UPI history after a subdivision: the old UPI stays on the historic parent only.
+  const parcelRows = (where, num = 50) =>
+    page.evaluate(
+      async ({ where, num }) => {
+        const info = window.__ps.registry.all().find((i) => i.fabricRole === "parcel-polygon");
+        const { sessionRows } = await import("/src/gis/layers/query.ts");
+        return sessionRows(info, { where, outFields: ["objectid", "name", "parcel_number", "retiredbyrecord"], num });
+      },
+      { where, num },
+    );
+  const recordTypeOf = (name) =>
+    page.evaluate(async (name) => {
+      const rec = window.__ps.registry.all().find((i) => i.fabricRole === "records");
+      const { sessionRows } = await import("/src/gis/layers/query.ts");
+      return (await sessionRows(rec, { where: `name = '${name}'`, outFields: ["recordtype"] }))[0]?.recordtype ?? null;
+    }, name);
+  const [origRow] = await parcelRows(`objectid = ${original.oid}`);
+  const childrenRightAfter = await parcelRows(`createdbyrecord = '${rec.globalId}' AND retiredbyrecord IS NULL`);
+  check(
+    "Subdivision: the original UPI stays on the historic parent only; the new parcels start without it",
+    origRow?.name === freeUpi && !!origRow.retiredbyrecord && childrenRightAfter.length === 3 && childrenRightAfter.every((r) => r.name == null && r.parcel_number == null),
+    `parent ${origRow?.name} historic=${!!origRow?.retiredbyrecord}; children ${childrenRightAfter.map((r) => `${r.objectid}:${r.name}`).join(", ")}`,
+  );
+  check("Subdivision: the record says which operation retired the parcel (recordtype 3 = Subdivision)", (await recordTypeOf(RECORD)) === 3, `recordtype ${await recordTypeOf(RECORD)}`);
+
   // ---- Assign UPIs opens straight after the divide, with suggestions
   await waitFor(async () => page.evaluate(() => window.__ps.editing.getState().assignUpiTargets.length === 3), 20000, "assign UPI dialog");
   await waitFor(async () => page.evaluate(() => { const ins = [...document.querySelectorAll("#dlg-assign-upi calcite-input-text")]; return ins.length === 3 && ins.every((i) => i.value); }), 30000, "UPI suggestions");
   const suggested = await page.evaluate(() => [...document.querySelectorAll("#dlg-assign-upi calcite-input-text")].map((i) => i.value));
-  check("Assign UPIs opens after divide with 3 valid, different suggestions", suggested.every((u) => UPI_RE.test(u)) && new Set(suggested).size === 3, suggested.join(", "));
+  check(
+    "Assign UPIs opens after divide with 3 valid, different, new suggestions (never the parent's expired UPI)",
+    suggested.every((u) => UPI_RE.test(u)) && new Set(suggested).size === 3 && !suggested.includes(freeUpi),
+    suggested.join(", "),
+  );
   await page.screenshot({ path: `${out}/p2-2d-assign-upi.png` });
   pend = (await state()).pending;
   await confirmDialog("#dlg-assign-upi", "Save UPIs", pend);
@@ -325,8 +356,71 @@ try {
     named.map((r) => `${r.name} #${r.parcel_number} ${r.district}/${r.sector}/${r.cell}/${r.village}`).join(" | "),
   );
 
-  // ---- merge two of them (Shift+G): the next UPI is suggested; a bad UPI is refused
-  await selectOids([named[0].objectid, named[1].objectid]);
+  // ---- Merge needs neighbours: check every pair of the three new parcels from their shapes
+  const neighbourCheck = (oids) =>
+    page.evaluate(async (oids) => {
+      const { parcelFabricService } = await import("/src/gis/parcel-fabric/parcelFabricService.ts");
+      return parcelFabricService.checkMergeNeighbours(oids);
+    }, oids);
+  const pairs = [
+    [named[0], named[1]],
+    [named[0], named[2]],
+    [named[1], named[2]],
+  ];
+  const pairProblems = await Promise.all(pairs.map((p) => neighbourCheck(p.map((r) => r.objectid))));
+  const adjacentPair = pairs[pairProblems.findIndex((p) => p === null)];
+  const apartPair = pairs[pairProblems.findIndex((p) => p !== null)];
+  check("Merge neighbour check: the divided parcels include a neighbouring pair", !!adjacentPair, pairProblems.map((p, i) => `${pairs[i].map((r) => r.name).join("+")}: ${p ?? "neighbours"}`).join(" | "));
+
+  // A pair that isn't neighbours (strips 1 and 3) is refused in the dialog, before anything is sent.
+  if (apartPair) {
+    await selectOids(apartPair.map((r) => r.objectid));
+    await sleep(1000);
+    await key("G", ["Shift"]);
+    await waitFor(async () => page.evaluate(() => window.__ps.editing.getState().mergeParcelsOpen), 10000, "merge dialog (not neighbours)");
+    await waitFor(async () => page.evaluate(() => !!document.querySelector("#merge-not-neighbours")), 30000, "not-neighbours notice");
+    const refusedUi = await page.evaluate(() => ({
+      text: document.querySelector("#merge-not-neighbours")?.textContent ?? "",
+      disabled: !![...document.querySelectorAll("#dlg-merge-parcels calcite-button")].find((x) => x.textContent.trim() === "Merge parcels")?.disabled,
+    }));
+    check("Merge of non-neighbouring parcels is refused in the dialog (button disabled, reason shown)", refusedUi.disabled && /share a boundary|not neighbours|corner/.test(refusedUi.text), refusedUi.text);
+    await deepClick("Cancel", { scope: "#dlg-merge-parcels", tags: ["CALCITE-BUTTON"] });
+    await sleep(800);
+  } else check("Merge of non-neighbouring parcels is refused in the dialog", true, "skipped: all three divided parcels touch each other");
+
+  // Not one connected group: a neighbouring pair plus a parcel far away.
+  const farParcel = (await parcelRows(`retiredbyrecord IS NULL AND name LIKE '_/__/__/__/%' AND (createdbyrecord IS NULL OR createdbyrecord <> '${rec.globalId}')`))[0];
+  const groupProblem = await neighbourCheck([...adjacentPair.map((r) => r.objectid), farParcel.objectid]);
+  check("Merge of several parcels that are not one connected group is refused", /not one connected group/.test(groupProblem ?? ""), groupProblem ?? "no problem reported");
+
+  // The service refuses it too (not only the dialog), and nothing is changed.
+  const pendBeforeRefusal = (await state()).pending;
+  const serviceRefusal = await page.evaluate(async (oids) => {
+    const { parcelFabricService } = await import("/src/gis/parcel-fabric/parcelFabricService.ts");
+    try {
+      await parcelFabricService.merge(oids, "1/02/13/02/999999");
+      return "merged!";
+    } catch (e) {
+      return e.message;
+    }
+  }, (apartPair ?? [...adjacentPair, farParcel]).map((r) => r.objectid));
+  check("Merge service refuses non-neighbours and sends nothing", /neighbours|share a boundary|corner/.test(serviceRefusal) && (await state()).pending === pendBeforeRefusal, serviceRefusal);
+
+  // The subdivision's record can't retire parcels by merge: a new record is needed.
+  const typeRefusal = await page.evaluate(async (oids) => {
+    const { parcelFabricService } = await import("/src/gis/parcel-fabric/parcelFabricService.ts");
+    try {
+      await parcelFabricService.merge(oids, "1/02/13/02/999999");
+      return "merged!";
+    } catch (e) {
+      return e.message;
+    }
+  }, adjacentPair.map((r) => r.objectid));
+  check("Merge with a Subdivision record is refused (one operation per record)", /is a Subdivision record/.test(typeRefusal), typeRefusal);
+  await createActiveRecord(page, { deepClick, waitFor, state }, RECORD_MERGE);
+
+  // ---- merge the neighbouring pair (Shift+G): the next UPI is suggested; a bad UPI is refused
+  await selectOids(adjacentPair.map((r) => r.objectid));
   await sleep(1000);
   await key("G", ["Shift"]);
   await waitFor(async () => page.evaluate(() => window.__ps.editing.getState().mergeParcelsOpen), 10000, "merge dialog");
@@ -348,12 +442,21 @@ try {
   pend = (await state()).pending;
   await confirmDialog("#dlg-merge-parcels", "Merge parcels", pend);
   await sleep(2000);
-  const afterMerge = await currentByRecord(rec.globalId);
-  const merged = afterMerge.find((r) => r.name === mergeSuggestion);
-  const third = afterMerge.find((r) => r.objectid === named[2].objectid);
+  const mergeRec = (await state()).record;
+  const merged = (await currentByRecord(mergeRec.globalId)).find((r) => r.name === mergeSuggestion);
+  const third = named.find((r) => !adjacentPair.includes(r));
   const mergedLineage = merged ? await lineageOf(merged.objectid) : null;
-  check("Merge: new parcel has the suggested UPI and its location fields", !!merged && merged.parcel_number === Number(mergeSuggestion.split("/").pop()) && !!merged.district && afterMerge.length === 2, JSON.stringify(merged ?? afterMerge));
-  check("Merge: the parents are kept as history (lineage through the record)", !!mergedLineage && !mergedLineage.historic && mergedLineage.createdBy === RECORD && mergedLineage.predecessors >= 2, JSON.stringify(mergedLineage));
+  check("Merge: new parcel has the suggested UPI and its location fields", !!merged && merged.parcel_number === Number(mergeSuggestion.split("/").pop()) && !!merged.district, JSON.stringify(merged));
+  check("Merge: the parents are kept as history (lineage through the record)", !!mergedLineage && !mergedLineage.historic && mergedLineage.createdBy === RECORD_MERGE && mergedLineage.predecessors >= 2, JSON.stringify(mergedLineage));
+  const parentUpis = adjacentPair.map((r) => r.name);
+  const parentRows = await parcelRows(`objectid IN (${adjacentPair.map((r) => r.objectid).join(",")})`);
+  const stillCurrent = await parcelRows(`retiredbyrecord IS NULL AND name IN (${parentUpis.map((u) => `'${u}'`).join(",")})`);
+  check(
+    "Merge: the parents' UPIs are expired — kept on the historic parents, on no current parcel",
+    parentRows.length === 2 && parentRows.every((r) => parentUpis.includes(r.name) && r.retiredbyrecord === mergeRec.globalId) && stillCurrent.length === 0,
+    `parents ${parentRows.map((r) => `${r.name} retired=${!!r.retiredbyrecord}`).join(", ")}; current with those UPIs: ${stillCurrent.length}`,
+  );
+  check("Merge: the record says which operation retired the parents (recordtype 1 = Merge)", (await recordTypeOf(RECORD_MERGE)) === 1, `recordtype ${await recordTypeOf(RECORD_MERGE)}`);
   const stAfter = await state();
   check("Undo is disabled after a Parcel Fabric operation (Discard still available)", !stAfter.canUndo && stAfter.pending > 0, `canUndo=${stAfter.canUndo} pending=${stAfter.pending}`);
 
@@ -369,7 +472,7 @@ try {
     return { text: panel.textContent.replace(/\s+/g, " "), items: [...panel.querySelectorAll("calcite-list-item")].map((i) => ({ label: i.label, description: i.description })) };
   });
   const historicItems = lineageUi.items.filter((i) => /Historic/.test(i.description ?? ""));
-  check("Properties show parcel lineage (status, record, earlier parcels)", lineageUi.text.includes("Current") && lineageUi.text.includes(RECORD) && historicItems.length >= 2, `earlier: ${historicItems.map((i) => i.label).join(", ")}`);
+  check("Properties show parcel lineage (status, record, earlier parcels)", lineageUi.text.includes("Current") && lineageUi.text.includes(RECORD_MERGE) && historicItems.length >= 2, `earlier: ${historicItems.map((i) => i.label).join(", ")}`);
   await page.screenshot({ path: `${out}/p2-2e-lineage.png` });
 
   // ---- retire the third parcel (Delete → Retire): it stays as history
@@ -386,7 +489,7 @@ try {
   await confirmDialog("#dlg-delete", "Retire (keep history)", pend, { detectErrors: false });
   await sleep(1500);
   const thirdLineage = await lineageOf(third.objectid);
-  check("Retire keeps the parcel as history, retired by the record", thirdLineage.found && thirdLineage.historic && thirdLineage.retiredBy === RECORD, JSON.stringify(thirdLineage));
+  check("Retire keeps the parcel as history, retired by the active record", thirdLineage.found && thirdLineage.historic && thirdLineage.retiredBy === RECORD_MERGE, JSON.stringify(thirdLineage));
 
   // ---- delete the merged parcel permanently: no history is kept
   await selectOids([merged.objectid]);
