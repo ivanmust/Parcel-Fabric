@@ -195,6 +195,26 @@ const gisCalls = (suffix: string) => fake.calls.filter((c) => c.url.endsWith(suf
 
 // ------------------------------------------------------------------ tests
 
+describe("version name {TYPE}-{CASE_NUMBER}-{DATE}", () => {
+  test("type code, case number and transaction date", async () => {
+    const { versionNameFor } = await import("../src/lais/laisService.js");
+    const at = "2026-11-25T10:00:00+02:00";
+    assert.equal(versionNameFor({ Transaction_ID: "CASE123", Transaction_Type: "Subdivision", Transaction_Date: at }), "SUBV-CASE123-20261125");
+    assert.equal(versionNameFor({ Transaction_ID: "CASE456", Transaction_Type: "Merge", Transaction_Date: at }), "MERG-CASE456-20261125");
+    assert.equal(versionNameFor({ Transaction_ID: "CASE789", Transaction_Type: "CorrectBoundaries", Transaction_Date: at }), "CORB-CASE789-20261125");
+    assert.equal(versionNameFor({ Transaction_ID: "CASE000", Transaction_Type: "CreatePlot", Transaction_Date: at }), "CRPL-CASE000-20261125");
+    // the date is the one LAIS wrote, not shifted to UTC
+    assert.equal(versionNameFor({ Transaction_ID: "C1", Transaction_Type: "Merge", Transaction_Date: "2026-11-25T00:30:00+02:00" }), "MERG-C1-20261125");
+  });
+  test("unsafe characters become '-', and the name never exceeds 62 characters", async () => {
+    const { versionNameFor } = await import("../src/lais/laisService.js");
+    assert.equal(versionNameFor({ Transaction_ID: "RW/2026:0012.A", Transaction_Type: "Subdivision", Transaction_Date: "2026-11-25T10:00:00Z" }), "SUBV-RW-2026-0012-A-20261125");
+    const long = versionNameFor({ Transaction_ID: "X".repeat(50), Transaction_Type: "Subdivision", Transaction_Date: "2026-11-25T10:00:00Z" });
+    assert.equal(long.length, 62);
+    assert.match(long, /^SUBV-X+-20261125$/);
+  });
+});
+
 describe("authentication", () => {
   test("missing or wrong key → 401 in LAIS shape, no GIS calls", async () => {
     for (const headers of [{}, { "x-api-key": "wrong" }, { Authorization: `Bearer ${KEY}` }]) {
@@ -265,7 +285,7 @@ describe("successful submission", () => {
     assert.equal(r.body.data.Transaction_Type, "Subdivision");
     assert.equal(r.body.data.Transaction_Status, "New");
     assert.equal(r.body.data.version_status, "VersionCreated");
-    assert.match(r.body.data.version_name, /^svc_lais\.LAIS_LAIS_SUB_2026_00125_[0-9A-F]{8}$/);
+    assert.equal(r.body.data.version_name, "svc_lais.SUBV-LAIS-SUB-2026-00125-20261124");
     assert.equal(r.body.data.stage, "InReview");
 
     const [create] = gisCalls("/create");
@@ -387,7 +407,7 @@ describe("version-only mode (default: LAIS account can read and create versions,
     assert.equal(r.status, 201, JSON.stringify(r.body));
     assert.equal(r.body.case, "Yes");
     assert.equal(r.body.data.version_status, "VersionCreated");
-    assert.match(r.body.data.version_name, /^svc_lais\.LAIS_/);
+    assert.match(r.body.data.version_name, /^svc_lais\.SUBV-LAIS-SUB-2026-00125-20261124$/);
     assert.equal(gisCalls("/create")[0]!.params.accessPermission, "public");
     assert.deepEqual(editCalls(), []);
     assert.equal(fake.plots.get(1)!.transaction_id, undefined, "DEFAULT must be untouched");
@@ -420,7 +440,7 @@ describe("version-only mode (default: LAIS account can read and create versions,
   });
 
   test("a version that exists without an API record is not adopted silently → 409", async () => {
-    fake.versions.push({ name: `${OWNER}.${(await import("../src/lais/laisService.js")).versionNameFor(valid.Transaction_ID)}`, guid: "{00000000-0000-0000-0000-000000000001}", access: "public", saved: new Map(), pending: null });
+    fake.versions.push({ name: `${OWNER}.${(await import("../src/lais/laisService.js")).versionNameFor(valid)}`, guid: "{00000000-0000-0000-0000-000000000001}", access: "public", saved: new Map(), pending: null });
     const r = await submit(valid);
     assert.equal(r.status, 409);
   });

@@ -9,7 +9,8 @@ LAIS ──POST /api/lais/transactions (X-API-Key)──► GIS Integration API
                                                    1. validate the request
                                                    2. exactly one Plot with name = UPI in sde.DEFAULT
                                                    3. Transaction_ID not already recorded (DEFAULT or its version)
-                                                   4. create PUBLIC version  LAIS_<Transaction_ID>_<hash>
+                                                   4. create PUBLIC version  {TYPE}-{CASE_NUMBER}-{DATE}
+                                                      e.g. SUBV-CASE123-20261125
                                                    5. startReading → startEditing → applyEdits(gdbVersion, sessionID)
                                                       → stopEditing(saveEdits=true) → stopReading
 GIS editors ── Version Manager ▸ LAIS transactions ── open version ▸ review ▸ reconcile/post
@@ -35,14 +36,16 @@ Status `stage`: `InReview` (version exists), `Posted` (fields found in sde.DEFAU
 | `case_` | `Yes` (decided by the API; failed submissions write nothing) |
 | `validation_message` | `Validated by the LAIS integration API` |
 | `version_status` | `VersionCreated` |
-| `version_name` | fully qualified version name, e.g. `svc_lais.LAIS_LAIS_SUB_2026_00125_1A2B3C4D` |
+| `version_name` | fully qualified version name, e.g. `svc_lais.SUBV-LAIS-SUB-2026-00125-20261124` |
+
+Version name = `{TYPE}-{CASE_NUMBER}-{DATE}`: TYPE `SUBV` Subdivision · `MERG` Merge · `CORB` CorrectBoundaries · `CRPL` CreatePlot; CASE_NUMBER = `Transaction_ID` (characters other than letters, digits, `-`, `_` become `-`); DATE = `yyyyMMdd` of `Transaction_Date` as sent; at most 62 characters. Two different Transaction_IDs that map to the same name are refused with 409 rather than sharing a version. Codes live in `TYPE_CODES` in `server/src/lais/laisService.ts` (the editor dialog's filter in `LaisTransactionsDialog.tsx` must match).
 
 Field names are resolved case-insensitively from the live layer metadata; the API refuses to run (503) if the layer is not branch versioned, a field is missing, or the `case_`/`version_status` domains lack `Yes`/`VersionCreated`.
 
 ## Safety properties
 
 - `applyEdits` is only ever sent with `gdbVersion` + `sessionID` of the transaction's own version, as an attribute-only **update** of the one matched Plot. No adds, deletes or geometry changes. Nothing reconciles or posts.
-- **Idempotency key = version name** (derived from `Transaction_ID`). Identical retry → 200 `duplicate: true`; same ID, different payload → 409. A retry after a failure reuses the version created by the failed attempt.
+- **Idempotency key = `Transaction_ID`** (kept in the ledger, which also stores the version name). Identical retry → 200 `duplicate: true`; same ID, different payload → 409. A retry after a failure reuses the version created by the failed attempt.
 - A failed edit stops the session with `saveEdits=false` and releases the read lock.
 - Concurrent requests for the same `Transaction_ID` are serialised in-process.
 - Every submission (accepted or rejected) is written to the audit log as `lais.transaction.submit`.

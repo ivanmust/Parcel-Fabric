@@ -211,7 +211,7 @@ paths:
         Server-to-server endpoint for LAIS. Synchronous: the result is final when the response arrives.
 
         The API validates the request, finds exactly one Plot whose UPI (`name`) matches in sde.DEFAULT,
-        creates a **public** named version `LAIS_<Transaction_ID>_<hash>` and records the transaction on
+        creates a **public** named version `{TYPE}-{CASE_NUMBER}-{DATE}` (e.g. `SUBV-CASE123-20261125`) and records the transaction on
         that Plot **inside the version** (`case_ = Yes`, `version_status = VersionCreated`). sde.DEFAULT is
         never edited; GIS editors review, reconcile and post the version.
 
@@ -432,7 +432,7 @@ components:
             Transaction_Date: { type: string, format: date-time, description: "Normalised to UTC" }
             case: { type: string, const: "Yes" }
             validation_message: { type: string }
-            version_name: { type: string, example: "svc_lais.LAIS_LAIS_SUB_2026_00125_1A2B3C4D" }
+            version_name: { type: string, example: "svc_lais.SUBV-LAIS-SUB-2026-00125-20261124" }
             version_status: { type: string, enum: [Pending, VersionCreated] }
             stage: { type: string, enum: [InReview, Posted] }
             duplicate: { type: boolean, description: "Present on an identical retry" }

@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { config } from "../config/env.js";
 import { logger } from "../logging/logger.js";
 import { arcgisPost, ArcGisError, type ArcGisJson } from "./arcgisClient.js";
@@ -9,7 +9,7 @@ import { clearLedgerForTests, getEntry, putEntry, type LedgerEntry } from "./led
  *
  *   1. find exactly one Plot in sde.DEFAULT whose `name` (UPI) matches
  *   2. reject a Transaction_ID that is already recorded (DEFAULT or its LAIS version)
- *   3. create a PUBLIC named version LAIS_<id>_<hash> owned by the integration account
+ *   3. create a PUBLIC named version {TYPE}-{CASE_NUMBER}-{DATE} owned by the integration account
  *   4. startReading → startEditing(sessionId) → applyEdits(gdbVersion, sessionID) → stopEditing(save)
  *
  * Edits are attribute-only UPDATES of that one Plot, always inside the named version.
@@ -20,7 +20,6 @@ import { clearLedgerForTests, getEntry, putEntry, type LedgerEntry } from "./led
 
 export const TRANSACTION_TYPES = ["Subdivision", "Merge", "CorrectBoundaries", "CreatePlot"] as const;
 export const TRANSACTION_STATUSES = ["New", "InProgress", "Approved", "Rejected"] as const;
-export const VERSION_PREFIX = "LAIS_";
 
 export interface LaisSubmission {
   UPI: string;
@@ -160,12 +159,32 @@ export function validateSubmission(body: unknown): { ok: true; value: LaisSubmis
 
 // ---------------------------------------------------------------- naming
 
-/** Deterministic version name (letters/digits/underscore, ≤ 62 chars) from Transaction_ID. */
-export function versionNameFor(transactionId: string): string {
-  const hash = createHash("sha256").update(transactionId).digest("hex").slice(0, 8).toUpperCase();
-  const base = transactionId.replace(/[^A-Za-z0-9]/g, "_").replace(/_+/g, "_").replace(/^_|_$/g, "").slice(0, 40);
-  return `${VERSION_PREFIX}${base}_${hash}`;
+/** Four-letter code per transaction type, the first part of the version name. */
+export const TYPE_CODES: Record<(typeof TRANSACTION_TYPES)[number], string> = {
+  Subdivision: "SUBV",
+  Merge: "MERG",
+  CorrectBoundaries: "CORB",
+  CreatePlot: "CRPL",
+};
+
+const MAX_VERSION_NAME = 62;
+
+/**
+ * Version name `{TYPE}-{CASE_NUMBER}-{DATE}`, e.g. SUBV-CASE123-20261125:
+ * TYPE = TYPE_CODES[Transaction_Type], CASE_NUMBER = Transaction_ID (letters, digits, - and _ kept;
+ * other characters become -), DATE = yyyyMMdd of Transaction_Date as LAIS wrote it.
+ * Deterministic, so a resubmission maps to the same version.
+ */
+export function versionNameFor(input: Pick<LaisSubmission, "Transaction_ID" | "Transaction_Type" | "Transaction_Date">): string {
+  const type = TYPE_CODES[input.Transaction_Type as keyof typeof TYPE_CODES] ?? "LAIS";
+  const date = input.Transaction_Date.slice(0, 10).replace(/-/g, "");
+  const room = MAX_VERSION_NAME - type.length - date.length - 2;
+  const caseNumber = input.Transaction_ID.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/-{2,}/g, "-").replace(/^-|-$/g, "").slice(0, room);
+  return `${type}-${caseNumber}-${date}`;
 }
+
+/** The short name (after the owner) of a fully qualified version name. */
+const shortVersionName = (full: string) => full.slice(full.lastIndexOf(".") + 1);
 
 const sql = (value: string) => `'${value.replace(/'/g, "''")}'`;
 
@@ -460,7 +479,8 @@ export async function submitTransaction(token: string, input: LaisSubmission): P
     const entry = await getEntry(input.Transaction_ID);
     if (entry && !entryMatches(entry, input)) return { kind: "conflict", errors: usedElsewhere };
 
-    const shortName = versionNameFor(input.Transaction_ID);
+    // An entry made before a naming change keeps the version name it was given.
+    const shortName = entry?.versionName ? shortVersionName(entry.versionName) : versionNameFor(input);
     let version = await findVersion(token, shortName);
     const writeAttributes = config.LAIS_WRITE_MODE === "attributes";
 
@@ -472,7 +492,7 @@ export async function submitTransaction(token: string, input: LaisSubmission): P
       return { kind: "duplicate", record: entryRecord(entry, "InReview") };
     }
     if (!entry && version) {
-      return { kind: "conflict", errors: duplicateIdError("A GIS version for this Transaction_ID already exists but has no API record. Contact the GIS integration administrator.") };
+      return { kind: "conflict", errors: duplicateIdError(`GIS version ${shortName} already exists for another submission. Contact the GIS integration administrator.`) };
     }
 
     // 3. New transaction, or the completion of an earlier attempt that failed part-way.
@@ -509,7 +529,7 @@ export async function transactionStatus(token: string, transactionId: string): P
   if (posted.record) return { kind: "found", record: toRecord(schema, posted.record, "Posted") };
   const entry = await getEntry(transactionId);
   if (!entry) return { kind: "not_found" };
-  const version = entry.versionName ? await findVersion(token, versionNameFor(transactionId)) : null;
+  const version = entry.versionName ? await findVersion(token, shortVersionName(entry.versionName)) : null;
   return { kind: "found", record: entryRecord(entry, entry.versionName && !version ? "Closed" : "InReview") };
 }
 

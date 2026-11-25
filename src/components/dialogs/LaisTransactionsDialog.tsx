@@ -6,11 +6,13 @@ import { useEditing } from "../../stores/editingStore";
 /**
  * LAIS transactions awaiting review.
  *
- * The LAIS integration API creates one PUBLIC version per transaction (LAIS_<id>_<hash>)
- * and records the transaction fields on the Plot inside it. Editors open the version
- * here, review the Plot, and reconcile/post it with the normal Version Manager tools.
+ * The LAIS integration API creates one PUBLIC version per transaction, named
+ * {TYPE}-{CASE_NUMBER}-{DATE} (e.g. SUBV-CASE123-20261125) with a description starting "LAIS ".
+ * Editors open the version here, review the Plot, and reconcile/post it with the normal
+ * Version Manager tools. (Keep the type codes in sync with server/src/lais/laisService.ts.)
  */
-const isLaisVersion = (v: VersionInfo) => /(^|\.)LAIS_/i.test(v.versionIdentifier.name);
+const LAIS_NAME = /(^|\.)((SUBV|MERG|CORB|CRPL)-.+-\d{8}|LAIS_.+)$/i;
+const isLaisVersion = (v: VersionInfo) => LAIS_NAME.test(v.versionIdentifier.name) || /^LAIS /.test(v.description ?? "");
 
 export function LaisTransactionsDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
   const versions = useEditing((s) => s.versions);
