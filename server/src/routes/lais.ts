@@ -34,11 +34,20 @@ export function laisFailure(req: Request, res: Response, status: number, message
   res.status(status).json({ success: false, case: "No", message, errors, requestId: req.id });
 }
 
-/** Dedicated LAIS authentication; never accepts or reuses a browser Portal token. */
+/**
+ * Dedicated LAIS authentication; never accepts or reuses a browser Portal token. During a key change
+ * LAIS_API_KEY_PREVIOUS (the old key) is accepted too, so LAIS can switch without downtime; remove it
+ * once LAIS uses the new key. Keys shorter than 32 characters are never accepted.
+ */
 lais.use((req, _res, next) => {
-  if (config.LAIS_API_KEY.length < 32 || !sameSecret(req.header("x-api-key"), config.LAIS_API_KEY)) {
+  const received = req.header("x-api-key");
+  const keys = [config.LAIS_API_KEY, config.LAIS_API_KEY_PREVIOUS].filter((k) => k.length >= 32);
+  // Compare against every key (constant time each), so timing doesn't reveal which one matched.
+  const matches = keys.map((k) => sameSecret(received, k));
+  if (config.LAIS_API_KEY.length < 32 || !matches.some(Boolean)) {
     throw new HttpError(401, "Valid LAIS API credentials are required", "unauthorized");
   }
+  if (!matches[0]) logger.warn({ requestId: req.id }, "LAIS authenticated with the previous API key; finish the key change");
   next();
 });
 
@@ -76,7 +85,7 @@ lais.post("/transactions", async (req, res) => {
 
   let outcome;
   try {
-    outcome = await withServiceToken((token) => submitTransaction(token, input));
+    outcome = await withServiceToken((token) => submitTransaction(token, input, parsed.listForm));
   } catch (error) {
     audit(req, input.Transaction_ID, "failure", { code: "GIS_ERROR" });
     throw gisFailure(error, input.Transaction_ID, "submission");
@@ -84,16 +93,16 @@ lais.post("/transactions", async (req, res) => {
 
   switch (outcome.kind) {
     case "invalid":
-      audit(req, input.Transaction_ID, "failure", { UPI: input.UPI, errors: outcome.errors.map((e) => e.code) });
+      audit(req, input.Transaction_ID, "failure", { UPIs: input.UPIs, errors: outcome.errors.map((e) => e.code) });
       return laisFailure(req, res, 422, "Validation failed", outcome.errors);
     case "conflict":
-      audit(req, input.Transaction_ID, "failure", { UPI: input.UPI, errors: outcome.errors.map((e) => e.code) });
+      audit(req, input.Transaction_ID, "failure", { UPIs: input.UPIs, errors: outcome.errors.map((e) => e.code) });
       return laisFailure(req, res, 409, "Transaction_ID conflict", outcome.errors);
     case "duplicate":
-      audit(req, input.Transaction_ID, "success", { UPI: input.UPI, duplicate: true, version: outcome.record.version_name });
+      audit(req, input.Transaction_ID, "success", { UPIs: input.UPIs, duplicate: true, version: outcome.record.version_name });
       return res.status(200).json({ success: true, case: "Yes", message: "This transaction was already recorded.", data: { ...outcome.record, duplicate: true } });
     case "created":
-      audit(req, input.Transaction_ID, "success", { UPI: input.UPI, version: outcome.record.version_name });
+      audit(req, input.Transaction_ID, "success", { UPIs: input.UPIs, version: outcome.record.version_name });
       return res.status(201).json({ success: true, case: "Yes", message: "Transaction validated and recorded in a GIS version for review.", data: outcome.record });
   }
 });

@@ -28,6 +28,8 @@ const EnvSchema = z.object({
   BOOKMARKS_DIR: z.string().default("data/bookmarks"),
   // LAIS-to-GIS integration. Empty defaults keep the endpoint disabled until configured.
   LAIS_API_KEY: z.string().default(""),
+  /** Only during a key change: the old key, still accepted until LAIS has switched. Then empty it. */
+  LAIS_API_KEY_PREVIOUS: z.string().default(""),
   LAIS_ARCGIS_USERNAME: z.string().default(""),
   LAIS_ARCGIS_PASSWORD: z.string().default(""),
   LAIS_ARCGIS_REFERER: z.url().default("http://localhost:5174"),

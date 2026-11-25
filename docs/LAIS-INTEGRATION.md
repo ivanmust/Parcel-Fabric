@@ -6,8 +6,11 @@ LAIS transactions are stored **on the existing Plot layer** (`ParcelFabric/Featu
 
 ```
 LAIS ──POST /api/lais/transactions (X-API-Key)──► GIS Integration API
-                                                   1. validate the request
-                                                   2. exactly one Plot with name = UPI in sde.DEFAULT
+                                                   1. validate the request (UPI or UPIs; parcel count per type)
+                                                   2. each UPI = exactly one CURRENT Plot in sde.DEFAULT
+                                                      (retired UPI → UPI_EXPIRED + the current UPIs that replaced it)
+                                                   2b. Merge: the parcels are neighbours, one connected group
+                                                      (ArcGIS relation F***1****: boundaries share a line)
                                                    3. Transaction_ID not already recorded (DEFAULT or its version)
                                                    4. create PUBLIC version  {TYPE}-{CASE_NUMBER}-{DATE}
                                                       e.g. SUBV-CASE123-20261125
@@ -17,6 +20,23 @@ GIS editors ── Version Manager ▸ LAIS transactions ── open version ▸
 ```
 
 Code: [server/src/lais/laisService.ts](../server/src/lais/laisService.ts) (workflow), [server/src/lais/arcgisClient.ts](../server/src/lais/arcgisClient.ts) (token + Referer), [server/src/routes/lais.ts](../server/src/routes/lais.ts) (HTTP), tests in [server/test/lais.test.ts](../server/test/lais.test.ts) (`npm test` in `server/`, fake ArcGIS, no network).
+
+## Parcels per transaction
+
+`UPI` (one parcel) or `UPIs` (a list, max 20), not both.
+
+| Type | Parcels | Extra check |
+| --- | --- | --- |
+| Subdivision | exactly 1 | — |
+| Merge | 2 or more | neighbours: one connected group sharing boundary lines (corner contact doesn't count); same rule as the web editor's Merge |
+| CorrectBoundaries | 1 or more | — |
+| CreatePlot | 0 or more | — |
+
+In `attributes` mode the transaction fields are written on every listed parcel. Resending the same parcels in a different order is the same transaction.
+
+## API key change without downtime
+
+Put the old key in `LAIS_API_KEY_PREVIOUS` and the new one in `LAIS_API_KEY`, restart; both work (the log warns while the old one is used). When LAIS has switched, empty `LAIS_API_KEY_PREVIOUS` and restart.
 
 ## Write modes (`LAIS_WRITE_MODE`)
 

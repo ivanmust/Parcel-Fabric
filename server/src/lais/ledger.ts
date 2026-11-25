@@ -11,13 +11,15 @@ import { config } from "../config/env.js";
  * query the status. One JSON file, replaced atomically; single API instance assumed.
  */
 export interface LedgerEntry {
-  UPI: string;
+  /** The parcels of the transaction (2+ for a Merge; none for a CreatePlot without a parent). */
+  UPIs: string[];
   Transaction_ID: string;
   Transaction_Type: string;
   Transaction_Status?: string;
   /** ISO 8601 as received */
   Transaction_Date: string;
-  objectId: number;
+  /** Object ids of the parcels, in the order of UPIs. */
+  objectIds: number[];
   versionName: string | null;
   /** True once the fields were also written on the Plot inside the version (attributes mode). */
   attributesWritten: boolean;
@@ -34,8 +36,14 @@ const key = (transactionId: string) => transactionId.toLowerCase();
 async function load(): Promise<Map<string, LedgerEntry>> {
   if (entries) return entries;
   try {
-    const list = JSON.parse(await readFile(file(), "utf8")) as LedgerEntry[];
-    entries = new Map(list.map((e) => [key(e.Transaction_ID), e]));
+    const list = JSON.parse(await readFile(file(), "utf8")) as Array<LedgerEntry & { UPI?: string; objectId?: number }>;
+    // Entries written before multi-parcel support held one UPI and one objectId.
+    const normalised = list.map(({ UPI, objectId, ...e }) => ({
+      ...e,
+      UPIs: e.UPIs ?? (UPI ? [UPI] : []),
+      objectIds: e.objectIds ?? (typeof objectId === "number" ? [objectId] : []),
+    }));
+    entries = new Map(normalised.map((e) => [key(e.Transaction_ID), e]));
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; // never silently drop a corrupt ledger
     entries = new Map();

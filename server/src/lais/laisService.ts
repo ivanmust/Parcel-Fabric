@@ -4,25 +4,17 @@ import { logger } from "../logging/logger.js";
 import { arcgisPost, ArcGisError, type ArcGisJson } from "./arcgisClient.js";
 import { clearLedgerForTests, getEntry, putEntry, type LedgerEntry } from "./ledger.js";
 
-/**
- * LAIS transaction workflow on the branch-versioned Plot layer (FeatureServer/17).
- *
- *   1. find exactly one Plot in sde.DEFAULT whose `name` (UPI) matches
- *   2. reject a Transaction_ID that is already recorded (DEFAULT or its LAIS version)
- *   3. create a PUBLIC named version {TYPE}-{CASE_NUMBER}-{DATE} owned by the integration account
- *   4. startReading → startEditing(sessionId) → applyEdits(gdbVersion, sessionID) → stopEditing(save)
- *
- * Edits are attribute-only UPDATES of that one Plot, always inside the named version.
- * Nothing is ever written to sde.DEFAULT; reconcile/post stay with authorised GIS editors.
- * The version name is derived from Transaction_ID, so it is also the idempotency key: a
- * retry finds the version and either returns the recorded result or finishes the edit.
- */
 
 export const TRANSACTION_TYPES = ["Subdivision", "Merge", "CorrectBoundaries", "CreatePlot"] as const;
 export const TRANSACTION_STATUSES = ["New", "InProgress", "Approved", "Rejected"] as const;
 
 export interface LaisSubmission {
-  UPI: string;
+  /**
+   * The parcels of the transaction, from `UPI` (one) or `UPIs` (a list).
+   * Merge: 2 or more neighbouring parcels · Subdivision: exactly 1 · CorrectBoundaries: 1 or more ·
+   * CreatePlot: 0 or more (a new plot may have no parent).
+   */
+  UPIs: string[];
   Transaction_ID: string;
   Transaction_Type: string;
   Transaction_Date: string;
@@ -33,10 +25,14 @@ export interface FieldError {
   field: string;
   code: string;
   message: string;
+  /** UPI_EXPIRED: the current UPIs of the parcels that replaced the expired one. */
+  replacedBy?: string[];
 }
 
 export interface LaisRecord {
+  /** The first parcel's UPI (kept for single-parcel clients); all of them are in UPIs. */
   UPI: string | null;
+  UPIs: string[];
   Transaction_ID: string | null;
   Transaction_Type: string | null;
   Transaction_Status: string | null;
@@ -45,11 +41,7 @@ export interface LaisRecord {
   validation_message: string | null;
   version_name: string | null;
   version_status: string | null;
-  /**
-   * InReview: its LAIS version exists and awaits GIS review.
-   * Posted:   the transaction fields are in sde.DEFAULT.
-   * Closed:   its version no longer exists (reconciled/posted or deleted by GIS).
-   */
+
   stage: "InReview" | "Posted" | "Closed";
 }
 
@@ -73,7 +65,8 @@ const UPI_PATTERN = /^\d\/\d{2}\/\d{2}\/\d{2}\/\d+$/;
 const TRANSACTION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]*$/;
 const ISO_WITH_ZONE =
   /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?(Z|[+-](\d{2}):(\d{2}))$/;
-const ALLOWED_KEYS = new Set(["UPI", "Transaction_ID", "Transaction_Type", "Transaction_Date", "Transaction_Status"]);
+const ALLOWED_KEYS = new Set(["UPI", "UPIs", "Transaction_ID", "Transaction_Type", "Transaction_Date", "Transaction_Status"]);
+export const MAX_UPIS = 20;
 const MAX = { UPI: 100, Transaction_ID: 50, Transaction_Type: 25, Transaction_Date: 64, Transaction_Status: 25 } as const;
 
 export function isValidTransactionDate(value: string): boolean {
@@ -92,8 +85,19 @@ function matchCode<T extends string>(value: string, codes: readonly T[]): T | un
   return codes.find((c) => c.toLowerCase() === value.toLowerCase());
 }
 
-/** Validate the LAIS request body. Field-specific errors; `case` and unknown keys are rejected. */
-export function validateSubmission(body: unknown): { ok: true; value: LaisSubmission } | { ok: false; errors: FieldError[] } {
+/** How many parcels each transaction type takes: [min, max]. */
+const UPI_COUNT: Record<(typeof TRANSACTION_TYPES)[number], [number, number]> = {
+  Merge: [2, MAX_UPIS],
+  Subdivision: [1, 1],
+  CorrectBoundaries: [1, MAX_UPIS],
+  CreatePlot: [0, MAX_UPIS],
+};
+
+/**
+ * Validate the LAIS request body. Field-specific errors; `case` and unknown keys are rejected.
+ * `listForm` says whether the parcels came as `UPIs` (errors then name `UPIs[i]`) or as `UPI`.
+ */
+export function validateSubmission(body: unknown): { ok: true; value: LaisSubmission; listForm: boolean } | { ok: false; errors: FieldError[] } {
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     return { ok: false, errors: [{ field: "body", code: "INVALID_BODY", message: "Send a JSON object with Content-Type: application/json." }] };
   }
@@ -127,15 +131,45 @@ export function validateSubmission(body: unknown): { ok: true; value: LaisSubmis
     return value;
   };
 
-  const UPI = text("UPI", true);
+  // The parcels: `UPI` (one) or `UPIs` (a list), not both. undefined = the list itself is invalid.
+  const badFormat = (field: string) => ({ field, code: "INVALID_UPI_FORMAT", message: "UPI must follow province/district/sector/cell/number, for example 1/02/13/02/1001." });
+  const hasOne = input.UPI !== undefined && input.UPI !== null;
+  const hasList = input.UPIs !== undefined && input.UPIs !== null;
+  let UPIs: string[] | undefined = [];
+  if (hasOne && hasList) {
+    errors.push({ field: "UPIs", code: "CONFLICTING_FIELDS", message: "Send either UPI (one parcel) or UPIs (a list of parcels), not both." });
+    UPIs = undefined;
+  } else if (hasList) {
+    const raw = input.UPIs;
+    if (!Array.isArray(raw)) {
+      errors.push({ field: "UPIs", code: "INVALID_TYPE", message: "UPIs must be a list of UPI strings." });
+      UPIs = undefined;
+    } else if (raw.length > MAX_UPIS) {
+      errors.push({ field: "UPIs", code: "TOO_LONG", message: `UPIs may list at most ${MAX_UPIS} parcels.` });
+      UPIs = undefined;
+    } else {
+      const list: string[] = [];
+      raw.forEach((u, i) => {
+        const field = `UPIs[${i}]`;
+        if (typeof u !== "string") return errors.push({ field, code: "INVALID_TYPE", message: `${field} must be a string.` });
+        const v = u.trim();
+        if (!v) return errors.push({ field, code: "REQUIRED_FIELD", message: `${field} must not be empty.` });
+        if (v.length > MAX.UPI) return errors.push({ field, code: "TOO_LONG", message: `${field} must be at most ${MAX.UPI} characters.` });
+        if (!UPI_PATTERN.test(v)) return errors.push(badFormat(field));
+        if (list.includes(v)) return errors.push({ field, code: "DUPLICATE_UPI", message: `${v} is listed more than once.` });
+        list.push(v);
+      });
+      UPIs = list.length === raw.length ? list : undefined;
+    }
+  } else if (hasOne) {
+    const v = text("UPI", true);
+    if (v && !UPI_PATTERN.test(v)) errors.push(badFormat("UPI"));
+    UPIs = v && UPI_PATTERN.test(v) ? [v] : undefined;
+  }
   const Transaction_ID = text("Transaction_ID", true);
   const typeRaw = text("Transaction_Type", true);
   const Transaction_Date = text("Transaction_Date", true);
   const statusRaw = text("Transaction_Status", false);
-
-  if (UPI && !UPI_PATTERN.test(UPI)) {
-    errors.push({ field: "UPI", code: "INVALID_UPI_FORMAT", message: "UPI must follow province/district/sector/cell/number, for example 1/02/13/02/1001." });
-  }
   if (Transaction_ID && !TRANSACTION_ID_PATTERN.test(Transaction_ID)) {
     errors.push({ field: "Transaction_ID", code: "INVALID_FORMAT", message: "Transaction_ID may contain letters, digits and . _ - : / and must start with a letter or digit." });
   }
@@ -151,10 +185,21 @@ export function validateSubmission(body: unknown): { ok: true; value: LaisSubmis
     errors.push({ field: "Transaction_Date", code: "INVALID_DATE", message: "Use an ISO 8601 date-time with an explicit timezone, for example 2026-11-24T08:30:00+02:00." });
   }
 
-  if (errors.length || !UPI || !Transaction_ID || !Transaction_Type || !Transaction_Date) {
+  // How many parcels this type of transaction needs.
+  if (Transaction_Type && UPIs) {
+    const [min, max] = UPI_COUNT[Transaction_Type];
+    if (UPIs.length < min || UPIs.length > max) {
+      const field = hasList ? "UPIs" : "UPI";
+      if (Transaction_Type === "Merge") errors.push({ field: "UPIs", code: "MERGE_NEEDS_TWO_UPIS", message: 'A Merge lists the UPIs of all parcels being merged, at least two: "UPIs": ["…", "…"].' });
+      else if (Transaction_Type === "Subdivision") errors.push({ field, code: "SUBDIVISION_NEEDS_ONE_UPI", message: "A Subdivision names exactly one parcel: the parcel being subdivided." });
+      else errors.push({ field, code: "REQUIRED_FIELD", message: `A ${Transaction_Type} names at least one parcel in UPI or UPIs.` });
+    }
+  }
+
+  if (errors.length || !UPIs || !Transaction_ID || !Transaction_Type || !Transaction_Date) {
     return { ok: false, errors };
   }
-  return { ok: true, value: { UPI, Transaction_ID, Transaction_Type, Transaction_Date, ...(Transaction_Status ? { Transaction_Status } : {}) } };
+  return { ok: true, listForm: hasList, value: { UPIs, Transaction_ID, Transaction_Type, Transaction_Date, ...(Transaction_Status ? { Transaction_Status } : {}) } };
 }
 
 // ---------------------------------------------------------------- naming
@@ -200,6 +245,10 @@ const LOGICAL_FIELDS = {
   validationMessage: "validation_message",
   versionStatus: "version_status",
   versionName: "version_name",
+  /** Parcel Fabric: set when the parcel was retired (merged, subdivided, …) and kept as history. */
+  retiredBy: "retiredbyrecord",
+  /** Parcel Fabric: the record that created the parcel (links a historic parcel to its successors). */
+  createdBy: "createdbyrecord",
 } as const;
 type Logical = keyof typeof LOGICAL_FIELDS;
 
@@ -251,19 +300,134 @@ interface VersionRef {
 
 type Attributes = Record<string, unknown>;
 
-async function queryPlots(token: string, schema: LayerSchema, where: string, gdbVersion?: string, outFields?: string[]): Promise<Attributes[]> {
+async function queryPlots(token: string, schema: LayerSchema, where: string, gdbVersion?: string, outFields?: string[], count = 3): Promise<Attributes[]> {
   const body = await arcgisPost(
     `${config.lais.plotLayerUrl}/query`,
     {
       where,
       outFields: (outFields ?? [schema.objectIdField, ...Object.values(schema.fields)]).join(","),
       returnGeometry: "false",
-      resultRecordCount: "3",
+      resultRecordCount: String(count),
       ...(gdbVersion ? { gdbVersion } : {}),
     },
     token,
   );
   return (body.features ?? []).map((f: { attributes?: Attributes }) => f.attributes ?? {});
+}
+
+const sqlList = (values: string[]) => values.map(sql).join(",");
+
+/** Plots with their shapes (sde.DEFAULT), and the coordinate system the shapes are in. */
+async function plotShapes(token: string, where: string, outFields: string[]) {
+  const body = await arcgisPost(`${config.lais.plotLayerUrl}/query`, { where, outFields: outFields.join(","), returnGeometry: "true", resultRecordCount: "100" }, token);
+  return {
+    spatialReference: body.spatialReference as object,
+    features: (body.features ?? []) as Array<{ attributes: Attributes; geometry: object }>,
+  };
+}
+
+/**
+ * Current parcels related to a shape by a DE-9IM relation (ArcGIS `esriSpatialRelRelation`):
+ * "F***1****" = interiors apart, boundaries share a line (neighbours, not a corner touch);
+ * "T********" = interiors overlap.
+ */
+async function relatedPlots(token: string, schema: LayerSchema, shape: object, spatialReference: object, relation: string, where: string): Promise<Attributes[]> {
+  const body = await arcgisPost(
+    `${config.lais.plotLayerUrl}/query`,
+    {
+      where,
+      geometry: JSON.stringify(shape),
+      geometryType: "esriGeometryPolygon",
+      inSR: JSON.stringify(spatialReference),
+      spatialRel: "esriSpatialRelRelation",
+      relationParam: relation,
+      outFields: [schema.objectIdField, schema.fields.upi].join(","),
+      returnGeometry: "false",
+      resultRecordCount: "100",
+    },
+    token,
+  );
+  return (body.features ?? []).map((f: { attributes?: Attributes }) => f.attributes ?? {});
+}
+
+/** Groups of ids connected through the given links. */
+function connectedGroups(ids: number[], links: Array<[number, number]>): number[][] {
+  const parent = new Map(ids.map((id) => [id, id]));
+  const root = (id: number): number => (parent.get(id) === id ? id : root(parent.get(id)!));
+  for (const [a, b] of links) if (parent.has(a) && parent.has(b)) parent.set(root(a), root(b));
+  const groups = new Map<number, number[]>();
+  for (const id of ids) groups.set(root(id), [...(groups.get(root(id)) ?? []), id]);
+  return [...groups.values()];
+}
+
+/**
+ * A Merge's parcels must be neighbours: one connected group in which each parcel shares a boundary
+ * line (not just a corner) with another. Same rule as the web editor's Merge. Null when they do.
+ */
+async function mergeNeighbourProblem(token: string, schema: LayerSchema, parcels: Array<{ objectId: number; upi: string }>): Promise<string | null> {
+  const oid = schema.objectIdField;
+  const ids = parcels.map((p) => p.objectId);
+  const shapes = await plotShapes(token, `${oid} IN (${ids.join(",")})`, [oid]);
+  const links: Array<[number, number]> = [];
+  for (const f of shapes.features) {
+    const self = Number(f.attributes[oid]);
+    const others = ids.filter((id) => id !== self);
+    const touching = await relatedPlots(token, schema, f.geometry, shapes.spatialReference, "F***1****", `${oid} IN (${others.join(",")})`);
+    for (const t of touching) links.push([self, Number(t[oid])]);
+  }
+  const groups = connectedGroups(ids, links);
+  if (groups.length === 1) return null;
+  const upi = new Map(parcels.map((p) => [p.objectId, p.upi]));
+  const named = groups.map((g) => `[${g.map((id) => upi.get(id)).join(", ")}]`);
+  return parcels.length === 2
+    ? `${parcels[0]!.upi} and ${parcels[1]!.upi} are not neighbours: they share no boundary. Only neighbouring parcels can be merged.`
+    : `The parcels are not one connected group of neighbours: ${named.join(" and ")} share no boundary with each other.`;
+}
+
+/** The current UPIs of the parcels that replaced a historic one (created by the record that retired it, overlapping it). */
+async function successorUpis(token: string, schema: LayerSchema, historic: { attributes: Attributes; geometry: object }, spatialReference: object): Promise<string[]> {
+  const f = schema.fields;
+  const record = historic.attributes[f.retiredBy];
+  if (typeof record !== "string" || !historic.geometry) return [];
+  const rows = await relatedPlots(token, schema, historic.geometry, spatialReference, "T********", `${f.createdBy} = ${sql(record)} AND ${f.retiredBy} IS NULL`);
+  return [...new Set(rows.map((r) => String(r[f.upi] ?? "")).filter(Boolean))].sort();
+}
+
+/**
+ * Each UPI must name exactly one current parcel. A UPI found only on historic parcels has expired
+ * (merged or subdivided): the error says which current parcels replaced it.
+ */
+async function resolveParcels(token: string, schema: LayerSchema, upis: string[], fieldOf: (i: number) => string): Promise<{ errors: FieldError[]; objectIds: number[] }> {
+  const f = schema.fields;
+  const oid = schema.objectIdField;
+  if (!upis.length) return { errors: [], objectIds: [] };
+  const current = await queryPlots(token, schema, `${f.upi} IN (${sqlList(upis)}) AND ${f.retiredBy} IS NULL`, undefined, [oid, f.upi], 200);
+  const byUpi = new Map<string, number[]>();
+  for (const r of current) byUpi.set(String(r[f.upi]), [...(byUpi.get(String(r[f.upi])) ?? []), Number(r[oid])]);
+  const missing = upis.filter((u) => !byUpi.has(u));
+  const historic = missing.length ? await plotShapes(token, `${f.upi} IN (${sqlList(missing)}) AND ${f.retiredBy} IS NOT NULL`, [oid, f.upi, f.retiredBy]) : null;
+
+  const errors: FieldError[] = [];
+  for (const [i, upi] of upis.entries()) {
+    const found = byUpi.get(upi) ?? [];
+    if (found.length > 1) {
+      errors.push({ field: fieldOf(i), code: "UPI_NOT_UNIQUE", message: `More than one current parcel has the UPI ${upi} in GIS. GIS must resolve the duplicate before this transaction can be accepted.` });
+    } else if (!found.length) {
+      const old = historic?.features.find((h) => h.attributes[f.upi] === upi);
+      if (!old) {
+        errors.push({ field: fieldOf(i), code: "PARCEL_NOT_FOUND", message: `No parcel with the UPI ${upi} exists in GIS.` });
+      } else {
+        const replacedBy = await successorUpis(token, schema, old, historic!.spatialReference);
+        errors.push({
+          field: fieldOf(i),
+          code: "UPI_EXPIRED",
+          message: `The UPI ${upi} has expired: GIS merged or subdivided that parcel.${replacedBy.length ? ` It is now ${replacedBy.join(", ")}.` : ""} Use the UPI of the current parcel.`,
+          ...(replacedBy.length ? { replacedBy } : {}),
+        });
+      }
+    }
+  }
+  return { errors, objectIds: errors.length ? [] : upis.map((u) => byUpi.get(u)![0]!) };
 }
 
 async function findVersion(token: string, shortName: string): Promise<VersionRef | null> {
@@ -315,8 +479,8 @@ function assertSuccess(body: ArcGisJson, what: string): void {
   if (body.success === false) throw new ArcGisError(`ArcGIS refused ${what}`);
 }
 
-/** Attribute update of exactly one Plot inside `version`, in its own exclusive edit session. */
-async function editInVersion(token: string, version: VersionRef, attributes: Attributes): Promise<void> {
+/** Attribute updates of the transaction's Plots inside `version`, in one exclusive edit session (all or none). */
+async function editInVersion(token: string, version: VersionRef, updates: Attributes[]): Promise<void> {
   const sessionId = `{${randomUUID().toUpperCase()}}`;
   const versionUrl = `${config.lais.versionManagementUrl}/versions/${version.guid.replace(/[{}]/g, "")}`;
   let reading = false;
@@ -328,11 +492,12 @@ async function editInVersion(token: string, version: VersionRef, attributes: Att
     editing = true;
     const result = await arcgisPost(
       `${config.lais.plotLayerUrl}/applyEdits`,
-      { gdbVersion: version.name, sessionID: sessionId, rollbackOnFailure: "true", updates: JSON.stringify([{ attributes }]) },
+      { gdbVersion: version.name, sessionID: sessionId, rollbackOnFailure: "true", updates: JSON.stringify(updates.map((attributes) => ({ attributes }))) },
       token,
     );
-    const update = result.updateResults?.[0] as { success?: boolean; error?: { description?: string } } | undefined;
-    if (!update?.success) throw new ArcGisError(update?.error?.description ?? "ArcGIS did not confirm the Plot update");
+    const results = (result.updateResults ?? []) as Array<{ success?: boolean; error?: { description?: string } }>;
+    const failed = results.find((r) => !r.success);
+    if (results.length !== updates.length || failed) throw new ArcGisError(failed?.error?.description ?? "ArcGIS did not confirm the Plot updates");
     assertSuccess(await arcgisPost(`${versionUrl}/stopEditing`, { sessionId, saveEdits: "true" }, token), "stopEditing");
     editing = false;
   } catch (error) {
@@ -359,10 +524,14 @@ function toIso(value: unknown): string | null {
   return null;
 }
 
-function toRecord(schema: LayerSchema, a: Attributes, stage: LaisRecord["stage"]): LaisRecord {
+/** A transaction recorded on Plots (one row per parcel; the fields are the same on each). */
+function toRecord(schema: LayerSchema, rows: Attributes[], stage: LaisRecord["stage"]): LaisRecord {
+  const a = rows[0] ?? {};
   const s = (k: Logical) => (a[schema.fields[k]] === undefined || a[schema.fields[k]] === null ? null : String(a[schema.fields[k]]));
+  const UPIs = [...new Set(rows.map((r) => String(r[schema.fields.upi] ?? "")).filter(Boolean))].sort();
   return {
-    UPI: s("upi"),
+    UPI: UPIs[0] ?? null,
+    UPIs,
     Transaction_ID: s("transactionId"),
     Transaction_Type: s("transactionType"),
     Transaction_Status: s("transactionStatus"),
@@ -375,27 +544,37 @@ function toRecord(schema: LayerSchema, a: Attributes, stage: LaisRecord["stage"]
   };
 }
 
-function samePayload(schema: LayerSchema, a: Attributes, input: LaisSubmission): boolean {
+const sameSet = (a: string[], b: string[]) => a.length === b.length && [...a].sort().every((v, i) => v === [...b].sort()[i]);
+
+/** Posted rows match the request: same type, date (and status if sent), and every requested UPI among them. */
+function samePayload(schema: LayerSchema, rows: Attributes[], input: LaisSubmission): boolean {
   const f = schema.fields;
+  const a = rows[0]!;
+  const upis = new Set(rows.map((r) => r[f.upi]));
   return (
-    a[f.upi] === input.UPI &&
+    input.UPIs.every((u) => upis.has(u)) &&
     a[f.transactionType] === input.Transaction_Type &&
     Number(a[f.transactionDate]) === Date.parse(input.Transaction_Date) &&
     (input.Transaction_Status === undefined || a[f.transactionStatus] === input.Transaction_Status)
   );
 }
 
-/** Is this Transaction_ID already in sde.DEFAULT (i.e. its fields were posted)? */
-async function findPosted(token: string, schema: LayerSchema, transactionId: string): Promise<{ record: Attributes | null; duplicates: boolean }> {
-  const rows = await queryPlots(token, schema, `${schema.fields.transactionId} = ${sql(transactionId)}`);
-  return { record: rows[0] ?? null, duplicates: rows.length > 1 };
+/**
+ * Is this Transaction_ID already in sde.DEFAULT (its fields posted on the Plot(s))? One transaction
+ * may be on several Plots (a Merge's parcels); rows that disagree on type or date are a conflict.
+ */
+async function findPosted(token: string, schema: LayerSchema, transactionId: string): Promise<{ rows: Attributes[]; inconsistent: boolean }> {
+  const f = schema.fields;
+  const rows = await queryPlots(token, schema, `${f.transactionId} = ${sql(transactionId)}`, undefined, undefined, 50);
+  const inconsistent = rows.some((r) => r[f.transactionType] !== rows[0]![f.transactionType] || r[f.transactionDate] !== rows[0]![f.transactionDate]);
+  return { rows, inconsistent };
 }
 
 const VALIDATED = "Validated by the LAIS integration API";
 
 function entryMatches(e: LedgerEntry, input: LaisSubmission): boolean {
   return (
-    e.UPI === input.UPI &&
+    sameSet(e.UPIs, input.UPIs) &&
     e.Transaction_Type === input.Transaction_Type &&
     Date.parse(e.Transaction_Date) === Date.parse(input.Transaction_Date) &&
     (e.Transaction_Status ?? undefined) === input.Transaction_Status
@@ -404,7 +583,8 @@ function entryMatches(e: LedgerEntry, input: LaisSubmission): boolean {
 
 function entryRecord(e: LedgerEntry, stage: LaisRecord["stage"]): LaisRecord {
   return {
-    UPI: e.UPI,
+    UPI: e.UPIs[0] ?? null,
+    UPIs: e.UPIs,
     Transaction_ID: e.Transaction_ID,
     Transaction_Type: e.Transaction_Type,
     Transaction_Status: e.Transaction_Status ?? null,
@@ -438,7 +618,9 @@ async function withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
 
 // ---------------------------------------------------------------- public API
 
-export async function submitTransaction(token: string, input: LaisSubmission): Promise<SubmitOutcome> {
+/** `listForm`: the parcels came as `UPIs`, so per-parcel errors name `UPIs[i]` (else `UPI`). */
+export async function submitTransaction(token: string, input: LaisSubmission, listForm = false): Promise<SubmitOutcome> {
+  const fieldOf = (i: number) => (listForm ? `UPIs[${i}]` : "UPI");
   return withLock(input.Transaction_ID.toLowerCase(), async () => {
     const schema = await layerSchema(token);
     const f = schema.fields;
@@ -453,25 +635,25 @@ export async function submitTransaction(token: string, input: LaisSubmission): P
       }
     }
 
-    const plots = await queryPlots(token, schema, `${f.upi} = ${sql(input.UPI)}`, undefined, [schema.objectIdField, f.upi]);
-    if (plots.length !== 1) {
-      return {
-        kind: "invalid",
-        errors: [plots.length === 0
-          ? { field: "UPI", code: "PARCEL_NOT_FOUND", message: "No parcel with this UPI exists in GIS." }
-          : { field: "UPI", code: "UPI_NOT_UNIQUE", message: "More than one parcel has this UPI in GIS. GIS must resolve the duplicate before this transaction can be accepted." }],
-      };
+    // Each UPI must be exactly one current parcel: a UPI retired by a merge or subdivision has expired.
+    const parcels = await resolveParcels(token, schema, input.UPIs, fieldOf);
+    if (parcels.errors.length) return { kind: "invalid", errors: parcels.errors };
+    const objectIds = parcels.objectIds;
+
+    // A Merge's parcels must be neighbours, one connected group (same rule as the web editor).
+    if (input.Transaction_Type === "Merge") {
+      const problem = await mergeNeighbourProblem(token, schema, objectIds.map((objectId, i) => ({ objectId, upi: input.UPIs[i]! })));
+      if (problem) return { kind: "invalid", errors: [{ field: "UPIs", code: "NOT_NEIGHBOURS", message: problem }] };
     }
-    const objectId = Number(plots[0]![schema.objectIdField]);
 
     const usedElsewhere = duplicateIdError("Transaction_ID has already been used for a different transaction. Use a new Transaction_ID; existing records are not overwritten.");
 
-    // 1. Already posted to sde.DEFAULT (fields present on the Plot)?
+    // 1. Already posted to sde.DEFAULT (fields present on the Plot(s))?
     const posted = await findPosted(token, schema, input.Transaction_ID);
-    if (posted.duplicates) return { kind: "conflict", errors: duplicateIdError("GIS holds more than one Plot with this Transaction_ID. Contact the GIS integration administrator.") };
-    if (posted.record) {
-      return samePayload(schema, posted.record, input)
-        ? { kind: "duplicate", record: toRecord(schema, posted.record, "Posted") }
+    if (posted.inconsistent) return { kind: "conflict", errors: duplicateIdError("GIS holds different transactions under this Transaction_ID. Contact the GIS integration administrator.") };
+    if (posted.rows.length) {
+      return samePayload(schema, posted.rows, input)
+        ? { kind: "duplicate", record: toRecord(schema, posted.rows, "Posted") }
         : { kind: "conflict", errors: usedElsewhere };
     }
 
@@ -497,13 +679,14 @@ export async function submitTransaction(token: string, input: LaisSubmission): P
 
     // 3. New transaction, or the completion of an earlier attempt that failed part-way.
     //    Record the intent first so a failure after version creation is recoverable on retry.
-    let current = entry ?? (await putEntry({ ...input, objectId, versionName: null, attributesWritten: false }));
-    version ??= await createVersion(token, shortName, `LAIS ${input.Transaction_Type} UPI ${input.UPI} ${input.Transaction_ID}`);
+    let current = entry ?? (await putEntry({ ...input, objectIds, versionName: null, attributesWritten: false }));
+    const parcelText = input.UPIs.length ? `UPI ${input.UPIs[0]}${input.UPIs.length > 1 ? ` +${input.UPIs.length - 1}` : ""}` : "new plot";
+    version ??= await createVersion(token, shortName, `LAIS ${input.Transaction_Type} ${parcelText} ${input.Transaction_ID}`);
     current = await putEntry({ ...current, versionName: version.name });
 
-    if (writeAttributes && !current.attributesWritten) {
-      await editInVersion(token, version, {
-        [schema.objectIdField]: objectId,
+    // Write the transaction on every parcel of it, inside the version (a CreatePlot without parent has none).
+    if (writeAttributes && !current.attributesWritten && objectIds.length) {
+      const fields = {
         [f.transactionId]: input.Transaction_ID,
         [f.transactionType]: input.Transaction_Type,
         [f.transactionDate]: Date.parse(input.Transaction_Date),
@@ -512,10 +695,11 @@ export async function submitTransaction(token: string, input: LaisSubmission): P
         [f.versionStatus]: "VersionCreated",
         [f.versionName]: version.name,
         ...(input.Transaction_Status ? { [f.transactionStatus]: input.Transaction_Status } : {}),
-      });
+      };
+      await editInVersion(token, version, objectIds.map((objectId) => ({ [schema.objectIdField]: objectId, ...fields })));
       current = await putEntry({ ...current, attributesWritten: true });
     }
-    logger.info({ transactionId: input.Transaction_ID, version: version.name, objectId, mode: config.LAIS_WRITE_MODE }, "LAIS transaction accepted");
+    logger.info({ transactionId: input.Transaction_ID, version: version.name, objectIds, mode: config.LAIS_WRITE_MODE }, "LAIS transaction accepted");
     return { kind: "created", record: entryRecord(current, "InReview") };
   });
 }
@@ -525,8 +709,8 @@ export type StatusOutcome = { kind: "found"; record: LaisRecord } | { kind: "not
 export async function transactionStatus(token: string, transactionId: string): Promise<StatusOutcome> {
   const schema = await layerSchema(token);
   const posted = await findPosted(token, schema, transactionId);
-  if (posted.duplicates) return { kind: "conflict" };
-  if (posted.record) return { kind: "found", record: toRecord(schema, posted.record, "Posted") };
+  if (posted.inconsistent) return { kind: "conflict" };
+  if (posted.rows.length) return { kind: "found", record: toRecord(schema, posted.rows, "Posted") };
   const entry = await getEntry(transactionId);
   if (!entry) return { kind: "not_found" };
   const version = entry.versionName ? await findVersion(token, shortVersionName(entry.versionName)) : null;
