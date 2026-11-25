@@ -4,7 +4,7 @@ import { useApp } from "../../stores/appStore";
 import { layerRegistry } from "../../gis/layers/layerRegistry";
 import { selectionService } from "../../gis/selection/selectionService";
 import { parcelFabricService, type DivideOption, type ParcelRef } from "../../gis/parcel-fabric/parcelFabricService";
-import { cellsOf, LOCATION_FIELDS, saveUpis, suggestUpis, upiAttributes, upiFormatProblem, upisInUse, UPI_EXAMPLE, type Location, type UpiSuggestion } from "../../gis/parcel-fabric/upi";
+import { cellsOf, LOCATION_FIELDS, saveUpis, storedUpis, suggestUpis, upiAttributes, upiFormatProblem, upisInUse, UPI_EXAMPLE, type Location, type UpiSuggestion } from "../../gis/parcel-fabric/upi";
 import { calciteInput } from "../../utils/calciteInput";
 import { useAsyncAction } from "../../hooks/useAsyncAction";
 import { ErrorNotice } from "../common/ErrorNotice";
@@ -108,6 +108,8 @@ function MergeParcelsDialog() {
   /** The parents' cells; the editor chooses one when there are several. */
   const [cells, setCells] = useState<string[]>([]);
   const [cell, setCell] = useState<string | null>(null);
+  /** Neighbour check: undefined while checking, null when they form one connected group, else why not. */
+  const [notNeighbours, setNotNeighbours] = useState<string | null | undefined>(undefined);
   const { isBusy, error, setError, run } = useAsyncAction();
   const close = () => {
     useEditing.getState().patch({ mergeParcelsOpen: false });
@@ -117,7 +119,22 @@ function MergeParcelsDialog() {
     setSuggestion(null);
     setCells([]);
     setCell(null);
+    setNotNeighbours(undefined);
   };
+
+  // Only neighbouring parcels can be merged: check the shapes as soon as the parcels are known.
+  useEffect(() => {
+    if (!open || !parcels || parcels.length < 2) return;
+    let stale = false;
+    setNotNeighbours(undefined);
+    parcelFabricService
+      .checkMergeNeighbours(parcels.map((p) => p.objectId))
+      .then((problem) => !stale && setNotNeighbours(problem))
+      .catch((e: Error) => !stale && setNotNeighbours(`The neighbour check could not run: ${e.message}`));
+    return () => {
+      stale = true;
+    };
+  }, [open, parcels]);
 
   // The new parcel's cell is the parents' cell; across cells the editor chooses it. Then suggest the UPI.
   useEffect(() => {
@@ -156,7 +173,7 @@ function MergeParcelsDialog() {
       close();
     });
 
-  const ready = editing && !!record && !!parcels && parcels.length >= 2 && name.trim().length > 0 && !formatProblem && !mustChooseCell;
+  const ready = editing && !!record && !!parcels && parcels.length >= 2 && notNeighbours === null && name.trim().length > 0 && !formatProblem && !mustChooseCell;
   return (
     <calcite-dialog id="dlg-merge-parcels" open={open || undefined} modal width="s" heading="Merge parcels" loading={isBusy || undefined} oncalciteDialogClose={close}>
       <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
@@ -178,6 +195,12 @@ function MergeParcelsDialog() {
             </ul>
           )}
           {parcels && parcels.length < 2 && <div className="muted">Select at least two current parcels.</div>}
+          {parcels && parcels.length >= 2 && notNeighbours === undefined && <div className="muted" style={{ fontSize: 12 }}>Checking that the parcels are neighbours…</div>}
+          {notNeighbours && (
+            <calcite-notice id="merge-not-neighbours" open kind="danger" scale="s" icon="exclamation-mark-triangle" style={{ marginTop: 8 }}>
+              <div slot="message">{notNeighbours}</div>
+            </calcite-notice>
+          )}
         </div>
         {cells.length > 1 && (
           <calcite-label scale="s">
@@ -410,7 +433,10 @@ function AssignUpiDialog() {
     setRows(null);
     (async () => {
       const parcels = await parcelFabricService.readParcels(targets);
-      const missing = parcels.filter((p) => !p.name || upiFormatProblem(p.name));
+      // A UPI of the parcel(s) these come from has expired with them: never offer it again.
+      const expired = new Set([...(await storedUpis(from)).values()].filter((u): u is string => !!u));
+      const usable = (name: string | null): name is string => !!name && !upiFormatProblem(name) && !expired.has(name);
+      const missing = parcels.filter((p) => !usable(p.name));
       const suggestion = missing.length ? await suggestUpis({ count: missing.length, parcels: missing.map((p) => p.objectId), from }) : null;
       if (stale) return;
       let k = 0;
@@ -420,7 +446,7 @@ function AssignUpiDialog() {
         parcels.map((p) => ({
           objectId: p.objectId,
           current: p.name,
-          upi: p.name && !upiFormatProblem(p.name) ? p.name : (suggestion?.upis[k++] ?? ""),
+          upi: usable(p.name) ? p.name : (suggestion?.upis[k++] ?? ""),
         })),
       );
     })().catch((e: Error) => !stale && setError(e.message));

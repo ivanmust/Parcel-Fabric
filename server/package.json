@@ -8,6 +8,7 @@
     "start": "node --env-file-if-exists=.env dist/index.js",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --import tsx --test test/lais.test.ts",
     "inspect-services": "tsx --env-file-if-exists=.env src/scripts/inspectServices.ts"
   },
   "dependencies": {

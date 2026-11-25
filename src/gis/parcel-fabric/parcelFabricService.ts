@@ -14,6 +14,7 @@ import { useEditing, isDefaultVersion } from "../../stores/editingStore";
 import { useApp } from "../../stores/appStore";
 import { arcgisError, fetchServiceJson } from "../../services/arcgis/serviceMetadata";
 import { LOCATION_FIELDS, UPI_PATTERN } from "./upi";
+import { mergeAdjacencyProblem } from "./adjacency";
 
 /**
  * Parcel Fabric operations through the ParcelFabricServer and ValidationServer REST extensions.
@@ -111,6 +112,80 @@ async function readParcels(objectIds: number[]): Promise<ParcelRef[]> {
     .map((a) => ({ objectId: a[info.layer.objectIdField] as number, globalId: a[info.layer.globalIdField ?? "globalid"] as string, name: (a.name as string) ?? null }));
 }
 
+/**
+ * The operation that retires parcels is kept on its record (Records `recordtype`: 1 Merge, 2 Split,
+ * 3 Subdivision), so the history says why each historic parcel's UPI expired. An untyped record gets
+ * the operation's type once the operation succeeds; a record typed for another operation is refused,
+ * so one record never retires parcels for two different reasons.
+ */
+type HistoryOperation = "Merge" | "Subdivision";
+const RECORD_TYPE: Record<HistoryOperation, number> = { Merge: 1, Subdivision: 3 };
+const ACCEPTED_RECORD_TYPES: Record<HistoryOperation, number[]> = { Merge: [1], Subdivision: [3, 2] };
+
+interface RecordTypeCheck {
+  objectId: number;
+  type: number | null;
+}
+
+/** Read the active record's type and refuse it when it belongs to another operation. */
+async function checkRecordType(operation: HistoryOperation): Promise<RecordTypeCheck | null> {
+  const record = requireRecord();
+  const rec = layerRegistry.byRole("records");
+  if (!rec || !hasField(rec.layer, "recordtype")) return null;
+  const oid = rec.layer.objectIdField;
+  const gid = rec.layer.globalIdField || "globalid";
+  const [row] = await sessionRows(rec, { where: `${gid} = ${sqlString(record.globalId)}`, outFields: [oid, "recordtype"] });
+  if (!row) throw new Error(`The active record "${record.name}" was not found in this version. Choose the active record again.`);
+  const type = row.recordtype == null ? null : Number(row.recordtype);
+  if (type !== null && !ACCEPTED_RECORD_TYPES[operation].includes(type)) {
+    const domain = rec.layer.getFieldDomain("recordtype");
+    const typeName = (domain?.type === "coded-value" ? domain.getName(type) : null) ?? `type ${type}`;
+    throw new Error(
+      `The active record "${record.name}" is a ${typeName} record. Create and activate a new record for this ${operation.toLowerCase()}, so the parcel history shows which operation retired each parcel.`,
+    );
+  }
+  return { objectId: row[oid] as number, type };
+}
+
+/** After the operation succeeded: give an untyped record the operation's type. */
+async function stampRecordType(check: RecordTypeCheck | null, operation: HistoryOperation): Promise<void> {
+  if (!check || check.type !== null) return;
+  const rec = layerRegistry.byRole("records")!;
+  const res = await rec.layer.applyEdits({ updateFeatures: [{ attributes: { [rec.layer.objectIdField]: check.objectId, recordtype: RECORD_TYPE[operation] } }] as never });
+  const failed = res.updateFeatureResults[0]?.error;
+  if (failed) throw new Error(`The record type could not be set: ${failed.message}`);
+}
+
+/**
+ * New parcels from a subdivision start without a UPI: whatever they copied from the parent (its UPI
+ * and parcel number) is cleared, so the parent's UPI lives on only in the historic parent.
+ */
+async function clearInheritedUpi(objectIds: number[]): Promise<void> {
+  const info = parcelLayer();
+  const fields = ["name", "parcel_number"].filter((f) => hasField(info.layer, f));
+  if (!objectIds.length || !fields.length) return;
+  const oid = info.layer.objectIdField;
+  const res = await info.layer.applyEdits({
+    updateFeatures: objectIds.map((id) => ({ attributes: { [oid]: id, ...Object.fromEntries(fields.map((f) => [f, null])) } })) as never,
+  });
+  const failed = res.updateFeatureResults.find((r) => r.error);
+  if (failed?.error) throw new Error(`The old UPI could not be cleared from the new parcels: ${failed.error.message}`);
+}
+
+/** Current parcels' shapes (data coordinate system, metres) with their UPIs, for the neighbour check. */
+async function mergeCandidates(objectIds: number[]) {
+  const info = parcelLayer();
+  const oid = info.layer.objectIdField;
+  const q = sessionQuery(info, { where: "retiredbyrecord IS NULL", objectIds, returnGeometry: true, outFields: [oid, "name"], outSpatialReference: info.layer.spatialReference });
+  const features = (await executeQueryJSON(info.url, q)).features;
+  if (features.length !== new Set(objectIds).size) throw new Error("Some selected parcels are historic or no longer exist. Reselect current parcels.");
+  return features.map((f) => ({
+    objectId: f.attributes[oid] as number,
+    label: (f.attributes.name as string | null) || `OBJECTID ${String(f.attributes[oid])}`,
+    geometry: f.geometry as Polygon,
+  }));
+}
+
 /** Slightly inside an area, so a feature that only touches its edge isn't counted as in it. */
 const inside = (area: Extent) => area.clone().expand(0.999);
 
@@ -161,8 +236,18 @@ export const parcelFabricService = {
   readParcels,
 
   /**
+   * Why these parcels can't be merged as neighbours (they must form one connected group sharing
+   * boundaries), or null. Reads the shapes at the session moment; needs no edit session.
+   */
+  async checkMergeNeighbours(objectIds: number[]): Promise<string | null> {
+    if (objectIds.length < 2) return null;
+    return mergeAdjacencyProblem(await mergeCandidates(objectIds));
+  },
+
+  /**
    * Merge parcels into one new parcel. The parents are retired by the active record and kept as
-   * historic parcels; the new parcel is created by the record.
+   * historic parcels with their UPIs; the new parcel is created by the record. The parents must be
+   * neighbours (one connected group), and the record must be a Merge record or untyped.
    */
   async merge(objectIds: number[], newName: string, extraAttributes: Record<string, string | number> = {}): Promise<{ moment?: number; created: number[] }> {
     if (objectIds.length < 2) throw new Error("Select at least two parcels to merge.");
@@ -172,6 +257,9 @@ export const parcelFabricService = {
     const record = requireRecord();
     const parents = await readParcels(objectIds);
     if (parents.length !== objectIds.length) throw new Error("Some selected parcels are historic or no longer exist. Reselect current parcels.");
+    const notNeighbours = await this.checkMergeNeighbours(objectIds);
+    if (notNeighbours) throw new Error(notNeighbours);
+    const recordType = await checkRecordType("Merge");
     const result = await callServer(`${serviceUrls().fabric}/merge`, {
       parentParcels: JSON.stringify(parents.map((p) => ({ id: p.globalId, layerId: String(info.serviceLayerId) }))),
       record: record.globalId,
@@ -180,10 +268,18 @@ export const parcelFabricService = {
       attributeOverrides: JSON.stringify({ type: "PropertySet", propertySetItems: ["name", name, ...Object.entries(extraAttributes).flat(), "isseed", 0] }),
     });
     versionSession.recordServerOperation("Merge parcels", result, { record: record.name, parents: parents.map((p) => p.name), newName: name });
+    try {
+      await stampRecordType(recordType, "Merge");
+    } catch (e) {
+      throw new Error(`The parcels were merged, but the history is incomplete: ${(e as Error).message} Use Discard to roll it back.`, { cause: e });
+    }
     return { moment: result.moment, created: addedObjectIds(result, info) };
   },
 
-  /** Divide a parcel by area or width. The parent is retired by the active record. */
+  /**
+   * Divide a parcel by area or width. The parent is retired by the active record and kept as a
+   * historic parcel with its UPI; the new parcels start without a UPI (see clearInheritedUpi).
+   */
   async divide(objectId: number, opts: { option: DivideOption; parts: number; areaOrWidth: number; bearing: number; leftSide: boolean; distributeRemainder: boolean }) {
     const info = parcelLayer();
     const record = requireRecord();
@@ -192,6 +288,7 @@ export const parcelFabricService = {
     if (opts.option !== "ProportionalArea" && !(opts.areaOrWidth > 0)) throw new Error("Enter the area (m²) or width (m) of each part.");
     const [parcel] = await readParcels([objectId]);
     if (!parcel) throw new Error("The selected parcel is historic or no longer exists.");
+    const recordType = await checkRecordType("Subdivision");
     const result = await callServer(`${serviceUrls().fabric}/divide`, {
       divideParcelGuid: parcel.globalId,
       divideParcelType: String(info.serviceLayerId),
@@ -206,7 +303,14 @@ export const parcelFabricService = {
       divideAssociatedLines: "true",
     });
     versionSession.recordServerOperation("Divide parcel", result, { record: record.name, parcel: parcel.name, ...opts });
-    return { moment: result.moment, created: addedObjectIds(result, info) };
+    const created = addedObjectIds(result, info);
+    try {
+      await clearInheritedUpi(created);
+      await stampRecordType(recordType, "Subdivision");
+    } catch (e) {
+      throw new Error(`The parcel was divided, but the history is incomplete: ${(e as Error).message} Use Discard to roll it back.`, { cause: e });
+    }
+    return { moment: result.moment, created };
   },
 
   /**
@@ -346,6 +450,7 @@ export const parcelFabricService = {
     const [[parent], [original], geometry] = await Promise.all([readParcels([objectId]), sessionRows(info, { objectIds: [objectId], outFields: ["*"] }), this.editableGeometry(objectId)]);
     if (!parent || !original) throw new Error("The selected parcel is historic or no longer exists.");
     if (JSON.stringify(geometry.rings) !== JSON.stringify(drawnOn.rings)) throw new Error("The parcel changed after the line was drawn. Draw it again.");
+    const recordType = await checkRecordType("Subdivision");
 
     const attributes: Record<string, unknown> = { createdbyrecord: record.globalId };
     if (hasField(layer, "isseed")) attributes.isseed = 0;
@@ -397,6 +502,7 @@ export const parcelFabricService = {
       });
       const failed = (await layer.applyEdits({ updateFeatures: updates as never })).updateFeatureResults.find((r) => r.error);
       if (failed?.error) throw new Error(failed.error.message);
+      await stampRecordType(recordType, "Subdivision");
       return ids;
     } catch (e) {
       throw new Error(`The parcel was cut, but the split didn't finish: ${(e as Error).message} Use Discard to roll it back.`, { cause: e });
