@@ -39,7 +39,7 @@ tags:
   - name: Bookmarks
     description: Saved map views per user
   - name: LAIS
-    description: LAIS transaction intake and named-version workflow
+    description: LAIS transaction intake (server-to-server, X-API-Key)
   - name: Diagnostics
     description: Browser error reporting
 
@@ -206,94 +206,72 @@ paths:
     post:
       tags: [LAIS]
       operationId: submitLaisTransaction
-      summary: Validate and record a LAIS transaction
-      description: Server-to-server endpoint. LAIS submits the four transaction fields; the API computes case. Validation failures return case=No. Successful inserts set case=Yes and version_status=Pending.
+      summary: Submit a LAIS transaction
+      description: |
+        Server-to-server endpoint for LAIS. Synchronous: the result is final when the response arrives.
+
+        The API validates the request, finds exactly one Plot whose UPI (`name`) matches in sde.DEFAULT,
+        creates a **public** named version `LAIS_<Transaction_ID>_<hash>` and records the transaction on
+        that Plot **inside the version** (`case_ = Yes`, `version_status = VersionCreated`). sde.DEFAULT is
+        never edited; GIS editors review, reconcile and post the version.
+
+        Idempotent by `Transaction_ID`: an identical retry returns 200 with `duplicate: true`; the same ID
+        with a different payload returns 409. After a 5xx, resubmit the same payload.
+      security:
+        - laisApiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/LaisTransactionRequest" }
+            example: { UPI: "1/02/13/02/1001", Transaction_ID: "LAIS-SUB-2026-00125", Transaction_Type: "Subdivision", Transaction_Date: "2026-11-24T08:30:00+02:00" }
+      responses:
+        "201":
+          description: Validated and recorded in a new public version
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LaisSuccess" }
+        "200":
+          description: Identical retry of a transaction already recorded (`data.duplicate` is true)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LaisSuccess" }
+        "400": { $ref: "#/components/responses/LaisFailure" }
+        "401": { $ref: "#/components/responses/LaisFailure" }
+        "409": { $ref: "#/components/responses/LaisFailure" }
+        "413": { $ref: "#/components/responses/LaisFailure" }
+        "422": { $ref: "#/components/responses/LaisFailure" }
+        "429": { $ref: "#/components/responses/LaisFailure" }
+        "500": { $ref: "#/components/responses/LaisFailure" }
+        "502": { $ref: "#/components/responses/LaisFailure" }
+        "503": { $ref: "#/components/responses/LaisFailure" }
+
+  /lais/transactions/{transactionId}:
+    get:
+      tags: [LAIS]
+      operationId: getLaisTransaction
+      summary: Status of a submitted LAIS transaction
+      description: "`stage` is `InReview` while the transaction is in its LAIS version and `Posted` once it is in sde.DEFAULT."
       security:
         - laisApiKey: []
       parameters:
-        - name: X-API-Key
-          in: header
-          required: true
-          schema: { type: string }
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              additionalProperties: false
-              required: [UPI, Transaction_ID, Transaction_Status, Transaction_Date]
-              properties:
-                UPI: { type: string, example: "1/02/13/02/1001" }
-                Transaction_ID: { type: string, example: "LAIS-SUB-2026-00125" }
-                Transaction_Status: { type: string, example: "COMPLETED" }
-                Transaction_Date: { type: string, format: date-time, example: "2026-11-24T08:30:00+02:00" }
-      responses:
-        "200":
-          description: An identical retry of a transaction already recorded successfully
-        "201":
-          description: Validated and recorded
-          content:
-            application/json:
-              example: { success: true, case: "Yes", data: { UPI: "1/02/13/02/1001", Transaction_ID: "LAIS-SUB-2026-00125", Transaction_Status: "COMPLETED", Transaction_Date: "2026-11-24T06:30:00.000Z", case: "Yes", version_status: "Pending" } }
-        "401": { description: Missing or invalid LAIS API key }
-        "409": { description: Duplicate Transaction_ID }
-        "422": { description: Validation failed; case=No and field-specific errors are returned }
-        "502": { description: GIS service could not validate or record the transaction }
-        "503": { description: LAIS GIS integration is not configured }
-
-  /lais-workflow/pending:
-    get:
-      tags: [LAIS]
-      operationId: listPendingLaisTransactions
-      summary: List validated LAIS transactions awaiting version generation
-      description: Requires an ArcGIS Portal session with versions:manage permission. Returns records where case is Yes and version_status is Pending.
-      responses:
-        "200":
-          description: Pending transactions
-          content:
-            application/json:
-              example:
-                transactions:
-                  - objectId: 27
-                    attributes: { UPI: "1/02/13/02/1001", Transaction_ID: "LAIS-SUB-2026-00125", Transaction_Status: "COMPLETED", Transaction_Date: 1795509000000, case: "Yes", version_status: "Pending" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "403": { $ref: "#/components/responses/Forbidden" }
-        "429": { $ref: "#/components/responses/TooManyRequests" }
-        "502": { description: GIS transaction table could not be queried }
-        "503": { description: Transaction table is not configured }
-
-  /lais-workflow/{objectId}/version:
-    post:
-      tags: [LAIS]
-      operationId: recordLaisGeneratedVersion
-      summary: Record the named version generated by the web application
-      description: Requires versions:manage. The web app creates the version through the signed-in user's VersionManagementService session, then calls this endpoint to record version_name and set version_status to Created. This endpoint does not create an ArcGIS version.
-      parameters:
-        - name: objectId
+        - name: transactionId
           in: path
           required: true
-          schema: { type: integer, minimum: 1 }
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              additionalProperties: false
-              required: [versionName]
-              properties:
-                versionName: { type: string, pattern: "^[A-Za-z][A-Za-z0-9_]{0,61}$" }
+          schema: { type: string, minLength: 1, maxLength: 50 }
       responses:
-        "200": { description: Version reference recorded }
-        "400": { $ref: "#/components/responses/BadRequest" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "403": { $ref: "#/components/responses/Forbidden" }
-        "404": { description: Transaction record was not found }
-        "409": { description: Transaction is not validated or is already linked to a different version }
-        "429": { $ref: "#/components/responses/TooManyRequests" }
-        "502": { description: GIS transaction table could not be updated }
-        "503": { description: Transaction table is not configured }
+        "200":
+          description: Transaction found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LaisSuccess" }
+        "400": { $ref: "#/components/responses/LaisFailure" }
+        "401": { $ref: "#/components/responses/LaisFailure" }
+        "404": { $ref: "#/components/responses/LaisFailure" }
+        "409": { $ref: "#/components/responses/LaisFailure" }
+        "429": { $ref: "#/components/responses/LaisFailure" }
+        "502": { $ref: "#/components/responses/LaisFailure" }
+        "503": { $ref: "#/components/responses/LaisFailure" }
 
   /client-log:
     post:
@@ -371,6 +349,27 @@ components:
       schema: { type: string }
 
   responses:
+    LaisFailure:
+      description: "Not recorded. errors[].code says why: REQUIRED_FIELD, INVALID_TYPE, TOO_LONG, UNKNOWN_FIELD, INVALID_UPI_FORMAT, INVALID_FORMAT, INVALID_TRANSACTION_TYPE, INVALID_TRANSACTION_STATUS, INVALID_DATE, PARCEL_NOT_FOUND, UPI_NOT_UNIQUE, DUPLICATE_TRANSACTION_ID, NOT_FOUND, INVALID_TRANSACTION_ID, UNAUTHORIZED, INVALID_JSON, PAYLOAD_TOO_LARGE, RATE_LIMITED, GIS_UNAVAILABLE, GIS_NOT_CONFIGURED, INTERNAL_ERROR."
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [success, case, message, errors]
+            properties:
+              success: { type: boolean, const: false }
+              case: { type: string, const: "No" }
+              message: { type: string }
+              errors:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    field: { type: string }
+                    code: { type: string }
+                    message: { type: string }
+              requestId: { type: string }
+          example: { success: false, case: "No", message: "Validation failed", errors: [{ field: "UPI", code: "PARCEL_NOT_FOUND", message: "No parcel with this UPI exists in GIS." }], requestId: "3f1c2a7e-0d5b-4139-9de0-c86997056829" }
     BadRequest:
       description: The request body or query is invalid (`invalid_json`, `invalid_audit_event`, `invalid_query`, `invalid_bookmarks`). `details` lists the problems.
       content:
@@ -407,6 +406,36 @@ components:
           schema: { $ref: "#/components/schemas/Error" }
 
   schemas:
+    LaisTransactionRequest:
+      type: object
+      additionalProperties: false
+      required: [UPI, Transaction_ID, Transaction_Type, Transaction_Date]
+      properties:
+        UPI: { type: string, maxLength: 100, pattern: '^\d/\d{2}/\d{2}/\d{2}/\d+$', example: "1/02/13/02/1001" }
+        Transaction_ID: { type: string, minLength: 1, maxLength: 50, pattern: '^[A-Za-z0-9][A-Za-z0-9._:/-]*$', example: "LAIS-SUB-2026-00125" }
+        Transaction_Type: { type: string, enum: [Subdivision, Merge, CorrectBoundaries, CreatePlot] }
+        Transaction_Date: { type: string, format: date-time, description: "ISO 8601 with an explicit timezone", example: "2026-11-24T08:30:00+02:00" }
+        Transaction_Status: { type: string, enum: [New, InProgress, Approved, Rejected], description: "Optional. Written to the Plot only when sent." }
+    LaisSuccess:
+      type: object
+      properties:
+        success: { type: boolean, const: true }
+        case: { type: string, const: "Yes" }
+        message: { type: string }
+        data:
+          type: object
+          properties:
+            UPI: { type: string }
+            Transaction_ID: { type: string }
+            Transaction_Type: { type: string }
+            Transaction_Status: { type: [string, "null"] }
+            Transaction_Date: { type: string, format: date-time, description: "Normalised to UTC" }
+            case: { type: string, const: "Yes" }
+            validation_message: { type: string }
+            version_name: { type: string, example: "svc_lais.LAIS_LAIS_SUB_2026_00125_1A2B3C4D" }
+            version_status: { type: string, enum: [Pending, VersionCreated] }
+            stage: { type: string, enum: [InReview, Posted] }
+            duplicate: { type: boolean, description: "Present on an identical retry" }
     Error:
       type: object
       required: [error]

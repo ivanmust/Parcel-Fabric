@@ -31,9 +31,15 @@ const EnvSchema = z.object({
   LAIS_ARCGIS_USERNAME: z.string().default(""),
   LAIS_ARCGIS_PASSWORD: z.string().default(""),
   LAIS_ARCGIS_REFERER: z.url().default("http://localhost:5174"),
+  /** Plot layer that stores LAIS transaction fields. Default: <FeatureServer>/17. */
   LAIS_PARCEL_LAYER_URL: z.string().default(""),
-  LAIS_TRANSACTION_TABLE_URL: z.string().default(""),
-  LAIS_ALLOWED_STATUSES: csv,
+  /**
+   * version-only: the LAIS account creates the public version and nothing else (read-only GIS rights).
+   * attributes:   it also writes the transaction fields on the Plot inside the version
+   *               (needs the Portal "Advanced Editing" user type extension).
+   */
+  LAIS_WRITE_MODE: z.enum(["version-only", "attributes"]).default("version-only"),
+  LAIS_DATA_DIR: z.string().default("data/lais"),
   /** Serve the OpenAPI description and Swagger UI at /api/docs. Default: on, except in production. */
   API_DOCS: z.enum(["true", "false"]).optional(),
 });
@@ -45,6 +51,12 @@ export type AppConfig = z.infer<typeof EnvSchema> & {
     parcelFabricServer: string;
     versionManagementServer: string;
     validationServer: string;
+  };
+  lais: {
+    /** Branch-versioned Plot layer, e.g. .../ParcelFabric/FeatureServer/17 */
+    plotLayerUrl: string;
+    /** VersionManagementServer of the same service as the Plot layer. */
+    versionManagementUrl: string;
   };
 };
 
@@ -62,8 +74,12 @@ function loadConfig(): AppConfig {
   }
   const env = parsed.data;
   const base = `${env.ARCGIS_SERVER_URL}/rest/services/${env.PARCEL_SERVICE_PATH}`;
+  const plotLayerUrl = trimSlash(env.LAIS_PARCEL_LAYER_URL || `${base}/FeatureServer/17`);
+  const layerMatch = /^(https?:\/\/.+)\/FeatureServer\/\d+$/i.exec(plotLayerUrl);
+  if (!layerMatch) throw new Error("Invalid server configuration: LAIS_PARCEL_LAYER_URL must be a .../FeatureServer/<layerId> URL");
   return {
     ...env,
+    lais: { plotLayerUrl, versionManagementUrl: `${layerMatch[1]}/VersionManagementServer` },
     services: {
       mapServer: `${base}/MapServer`,
       featureServer: `${base}/FeatureServer`,

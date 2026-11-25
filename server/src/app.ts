@@ -1,4 +1,4 @@
-import express from "express";
+import express, { type Request, type Response } from "express";
 import helmet from "helmet";
 import { rateLimit } from "express-rate-limit";
 import { pinoHttp } from "pino-http";
@@ -12,7 +12,7 @@ import { lais } from "./routes/lais.js";
 import { laisWorkflow } from "./routes/laisWorkflow.js";
 import { bookmarks } from "./routes/bookmarks.js";
 import { docs } from "./routes/docs.js";
-import { errorHandler, notFound } from "./middleware/errorHandler.js";
+import { errorHandler, isLaisRequest, notFound } from "./middleware/errorHandler.js";
 
 export function createApp() {
   const app = express();
@@ -76,10 +76,18 @@ export function createApp() {
     next();
   });
 
-  app.use("/api", rateLimit({ windowMs: 60_000, limit: 600, standardHeaders: "draft-8", legacyHeaders: false }));
+  const tooMany = (req: Request, res: Response) => {
+    const message = "Too many requests. Retry after the number of seconds in the Retry-After header.";
+    if (isLaisRequest(req)) {
+      res.status(429).json({ success: false, case: "No", message, errors: [{ field: "request", code: "RATE_LIMITED", message }], requestId: req.id });
+    } else {
+      res.status(429).json({ error: { code: "rate_limited", message, requestId: req.id } });
+    }
+  };
+  app.use("/api", rateLimit({ windowMs: 60_000, limit: 600, standardHeaders: "draft-8", legacyHeaders: false, handler: tooMany }));
   app.use(express.json({ limit: "256kb" }));
   app.use("/api", api);
-  app.use("/api/lais", rateLimit({ windowMs: 60_000, limit: 60, standardHeaders: "draft-8", legacyHeaders: false }));
+  app.use("/api/lais", rateLimit({ windowMs: 60_000, limit: 60, standardHeaders: "draft-8", legacyHeaders: false, handler: tooMany }));
   app.use("/api/lais", lais);
   app.use("/api/lais-workflow", laisWorkflow);
   app.use("/api", bookmarks);

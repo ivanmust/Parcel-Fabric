@@ -1,125 +1,62 @@
 # LAIS ↔ GIS transaction integration
 
-## Decision
+## Design (implemented)
 
-Use a separate, non-spatial transaction table in the existing ArcGIS Enterprise GIS environment. Do not add LAIS transaction columns to the parcel polygon layer and do not give LAIS direct database or unrestricted Feature Service access.
+LAIS transactions are stored **on the existing Plot layer** (`ParcelFabric/FeatureServer/17`), not in a separate table, and **only inside a named branch version** — never in `sde.DEFAULT`.
 
-The existing parcel polygon layer stores the UPI in its `name` field. The integration API must map the external `UPI` value to that field when it checks that a parcel exists.
-
-## Responsibilities
-
-- **LAIS** submits `UPI`, `Transaction_ID`, `Transaction_Status`, and `Transaction_Date`.
-- **GIS Transaction Integration API** authenticates LAIS independently of Portal user sessions, validates the payload, checks the parcel UPI and duplicate transaction ID, writes accepted transaction records, and returns the API-controlled `case` result.
-- **Web editing application** reads eligible transaction records and creates the named ArcGIS version through the existing signed-in user's VersionManagementService session and permissions.
-- **ArcGIS Enterprise** remains the system of record for parcel geometry and transaction records.
-
-LAIS must not send or choose `case`. The API computes it. A failed validation returns `case: "No"` and field-specific errors; no version may be created. A successful validation writes a record with `case: "Yes"` and makes it eligible for the web application's version workflow.
-
-## Transaction table proposal
-
-Publish a non-spatial table in the existing Parcel Fabric Feature Service (or an approved companion Feature Service in the same ArcGIS Enterprise deployment). The exact table ID and actual field names must be taken from the live Feature Service metadata before enabling writes.
-
-| Field | Suggested type | Purpose |
-| --- | --- | --- |
-| `UPI` | String | Parcel identifier received from LAIS |
-| `Transaction_ID` | String | LAIS transaction identifier; unique |
-| `Transaction_Status` | String | Status supplied by LAIS |
-| `Transaction_Date` | Date | Transaction date supplied by LAIS |
-| `case` | String (length 3) | API-controlled `Yes` or `No` validation result |
-| `validation_message` | String | Validation result details for audit and support |
-| `version_name` | String | Named version created by the web application |
-| `version_status` | String | Workflow state, e.g. Pending / Created / Failed |
-| `created_at` | Date | API record creation time |
-
-Use a GlobalID/ObjectID primary identifier supplied by ArcGIS. Enforce uniqueness for `Transaction_ID` if the service/database supports it. Keep transaction records as history; do not overwrite prior transactions when a parcel is processed again.
-
-The table should be related to parcels by UPI at the application level. Do not create an ArcGIS relationship class until the parcel key's uniqueness and the service's relationship/branch-versioning constraints have been verified.
-
-## Proposed LAIS API contract
-
-### Submit a transaction
-
-`POST /api/lais/transactions`
-
-Authentication: a dedicated LAIS credential (prefer OAuth 2.0 client credentials or mTLS; a high-entropy API key may be used for a controlled initial deployment). This is separate from the Portal bearer-token middleware used by the browser application.
-
-Request body:
-
-```json
-{
-  "UPI": "1/02/13/02/1001",
-  "Transaction_ID": "LAIS-SUB-2026-00125",
-  "Transaction_Status": "COMPLETED",
-  "Transaction_Date": "2026-11-24T08:30:00+02:00"
-}
+```
+LAIS ──POST /api/lais/transactions (X-API-Key)──► GIS Integration API
+                                                   1. validate the request
+                                                   2. exactly one Plot with name = UPI in sde.DEFAULT
+                                                   3. Transaction_ID not already recorded (DEFAULT or its version)
+                                                   4. create PUBLIC version  LAIS_<Transaction_ID>_<hash>
+                                                   5. startReading → startEditing → applyEdits(gdbVersion, sessionID)
+                                                      → stopEditing(saveEdits=true) → stopReading
+GIS editors ── Version Manager ▸ LAIS transactions ── open version ▸ review ▸ reconcile/post
 ```
 
-The request deliberately excludes `case`: the API owns that decision.
+Code: [server/src/lais/laisService.ts](../server/src/lais/laisService.ts) (workflow), [server/src/lais/arcgisClient.ts](../server/src/lais/arcgisClient.ts) (token + Referer), [server/src/routes/lais.ts](../server/src/routes/lais.ts) (HTTP), tests in [server/test/lais.test.ts](../server/test/lais.test.ts) (`npm test` in `server/`, fake ArcGIS, no network).
 
-Validation should include:
-1. All four submitted fields are present and non-empty.
-2. UPI follows the existing Rwanda UPI format and matches an existing parcel's `name` value.
-3. Transaction_ID has not already been recorded (retries should be idempotent where the payload is identical; conflicting reuse must be rejected).
-4. Transaction_Status is accepted by the business-approved status list. Until LAIS and GIS agree that list, only presence/type can be enforced.
-5. Transaction_Date is a valid, unambiguous date/time and is normalized consistently before storage.
+## Write modes (`LAIS_WRITE_MODE`)
 
-Validation failure response (HTTP 400 or 422):
+- **`version-only` (current default):** the LAIS ArcGIS account only **reads** GIS and **creates** the public version (steps 1–4). It makes no edit calls, so it needs no editing licence. The accepted transaction is kept in the server ledger `server/data/lais/transactions.json` (idempotency, duplicate detection, status). The version description says `LAIS <type> UPI <upi> <Transaction_ID>`; the fields below are left for GIS editors.
+- **`attributes`:** additionally performs step 5 and writes the fields below on the Plot inside the version. Requires the Portal **Advanced Editing** user type extension on the LAIS account (without it ArcGIS refuses `startEditing`; the API then answers 503).
 
-```json
-{
-  "success": false,
-  "case": "No",
-  "message": "Validation failed",
-  "errors": [
-    {
-      "field": "Transaction_Date",
-      "code": "REQUIRED_FIELD",
-      "message": "Transaction_Date is required."
-    }
-  ]
-}
-```
+Status `stage`: `InReview` (version exists), `Posted` (fields found in sde.DEFAULT), `Closed` (version no longer exists — reconciled/posted or deleted by GIS; a resubmission does not recreate it).
 
-Validation success response (HTTP 201):
+## Plot layer fields written (inside the version, `attributes` mode only)
 
-```json
-{
-  "success": true,
-  "case": "Yes",
-  "message": "Transaction validated and recorded.",
-  "data": {
-    "UPI": "1/02/13/02/1001",
-    "Transaction_ID": "LAIS-SUB-2026-00125",
-    "Transaction_Status": "COMPLETED",
-    "Transaction_Date": "2026-11-24T08:30:00+02:00",
-    "case": "Yes",
-    "version_status": "Pending"
-  }
-}
-```
+| Field | Value |
+| --- | --- |
+| `transaction_id` | LAIS `Transaction_ID` (≤ 50) |
+| `transaction_type` | `Transaction_Type` — domain KGL_TransactionType |
+| `transaction_status` | `Transaction_Status` **only if LAIS sends it** — domain KGL_TransactionStatus |
+| `transaction_date` | `Transaction_Date` (stored as UTC) |
+| `case_` | `Yes` (decided by the API; failed submissions write nothing) |
+| `validation_message` | `Validated by the LAIS integration API` |
+| `version_status` | `VersionCreated` |
+| `version_name` | fully qualified version name, e.g. `svc_lais.LAIS_LAIS_SUB_2026_00125_1A2B3C4D` |
 
-A failed validation is returned with `case: "No"`; it must never create a version. Whether rejected attempts themselves should also be persisted as table rows is a separate audit-retention decision and must not be assumed, because some submitted fields may be missing or invalid.
+Field names are resolved case-insensitively from the live layer metadata; the API refuses to run (503) if the layer is not branch versioned, a field is missing, or the `case_`/`version_status` domains lack `Yes`/`VersionCreated`.
 
-### Web editing application: generate and record a version
+## Safety properties
 
-The implementation adds these Portal-authenticated workflow endpoints:
+- `applyEdits` is only ever sent with `gdbVersion` + `sessionID` of the transaction's own version, as an attribute-only **update** of the one matched Plot. No adds, deletes or geometry changes. Nothing reconciles or posts.
+- **Idempotency key = version name** (derived from `Transaction_ID`). Identical retry → 200 `duplicate: true`; same ID, different payload → 409. A retry after a failure reuses the version created by the failed attempt.
+- A failed edit stops the session with `saveEdits=false` and releases the read lock.
+- Concurrent requests for the same `Transaction_ID` are serialised in-process.
+- Every submission (accepted or rejected) is written to the audit log as `lais.transaction.submit`.
 
-- `GET /api/lais-workflow/pending` — requires `versions:manage`; returns rows where `case = "Yes"` and `version_status = "Pending"`.
-- `POST /api/lais-workflow/{objectId}/version` — requires `versions:manage`; verifies that the row is validated and pending, then records `version_name` and sets `version_status = "Created"`. It does not create the ArcGIS version itself.
+## Known limitations / decisions still open
 
-In the existing Version Manager, an authorized editor opens **LAIS transactions**. For each pending record, the app creates a private named version using the existing `versionSession.createVersion(name, access, description)` method and the signed-in user's VersionManagementService session. It then calls the second endpoint to record the version. The version name is deterministic from the LAIS Transaction_ID, so if version creation succeeds but the table update fails, retrying finds the existing version instead of creating a duplicate.
+- Two *different* Transaction_IDs for the same UPI get two versions; they will conflict at reconcile. Decide whether LAIS should be blocked from submitting a second transaction while one is in review.
+- Once a version is posted and a later transaction overwrites `transaction_id` on the same Plot, the earlier ID can no longer be found (it lives only in history/archive).
+- The in-process lock assumes one API instance. Run a single instance, or add a shared lock, before scaling out.
+- The service account owns the versions. To reconcile/post them, GIS editors need the Portal privilege to manage versions they don't own (version administrator), or an administrator does it.
 
-The app does not automatically switch the editor's active version; the user can select the new version in Version Manager. LAIS credentials are never used for version creation. The transaction table must be shared with authorized editors with query and update privileges, and its `version_name` and `version_status` fields must exist.
+## Deployment checklist
 
-## Configuration and deployment gates
-
-Do not enable write operations until all of the following are known and configured:
-
-- Live Feature Service URL, table ID, and exact table field names/types.
-- Parcel layer ID and confirmation that its UPI field is `name` in the deployed service.
-- A least-privilege ArcGIS service identity/token strategy for server-side table edits. Do not use a database owner account or expose ArcGIS credentials/tokens to LAIS.
-- A dedicated LAIS client authentication mechanism and secret provisioning outside source control.
-- The authoritative set of allowed `Transaction_Status` values and date/time interpretation (timezone/date-only versus timestamp).
-- The policy for persisting rejected attempts and the web application's version naming/creation trigger.
-
-The existing `server/src/scripts/inspectServices.ts` script can produce the live service metadata report. Run it in the deployment environment with a least-privilege named Portal account and review the table list/fields before setting the table ID. Never commit `server/.env` or generated credentials.
+- Public HTTPS URL behind a reverse proxy; set `trust proxy` for that proxy so rate limits see the LAIS IP; allow-list LAIS's IPs at the firewall.
+- `NODE_ENV=production` (also turns off `/api/docs` unless `API_DOCS=true`).
+- `LAIS_API_KEY` ≥ 32 random characters, shared with LAIS out of band. `LAIS_ARCGIS_REFERER` = the API's public origin.
+- Service account: can query Layer 17, create versions and edit in its own versions.
