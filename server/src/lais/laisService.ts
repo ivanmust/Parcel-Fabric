@@ -67,7 +67,8 @@ const ISO_WITH_ZONE =
   /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?(Z|[+-](\d{2}):(\d{2}))$/;
 const ALLOWED_KEYS = new Set(["UPI", "UPIs", "Transaction_ID", "Transaction_Type", "Transaction_Date", "Transaction_Status"]);
 export const MAX_UPIS = 20;
-const MAX = { UPI: 100, Transaction_ID: 50, Transaction_Type: 25, Transaction_Date: 64, Transaction_Status: 25 } as const;
+// Transaction_ID has no maximum length (agreed with LAIS, 2026-11-25); the request body limit (256 KB) still applies.
+const MAX = { UPI: 100, Transaction_ID: Number.POSITIVE_INFINITY, Transaction_Type: 25, Transaction_Date: 64, Transaction_Status: 25 } as const;
 
 export function isValidTransactionDate(value: string): boolean {
   const m = ISO_WITH_ZONE.exec(value);
@@ -256,6 +257,8 @@ interface LayerSchema {
   objectIdField: string;
   fields: Record<Logical, string>;
   domains: Partial<Record<Logical, string[]>>;
+  /** Text field lengths, where the layer states one. */
+  lengths: Partial<Record<Logical, number>>;
 }
 
 let schemaCache: { value: LayerSchema; at: number } | null = null;
@@ -267,10 +270,11 @@ async function layerSchema(token: string): Promise<LayerSchema> {
   if (meta.isDataBranchVersioned !== true) {
     throw new LaisConfigurationError("The configured Plot layer is not branch versioned; refusing to edit it.");
   }
-  const byLower = new Map<string, { name: string; domain?: { codedValues?: Array<{ code: unknown }> } }>();
+  const byLower = new Map<string, { name: string; length?: number; domain?: { codedValues?: Array<{ code: unknown }> } }>();
   for (const f of meta.fields ?? []) byLower.set(String(f.name).toLowerCase(), f);
   const fields = {} as Record<Logical, string>;
   const domains: Partial<Record<Logical, string[]>> = {};
+  const lengths: Partial<Record<Logical, number>> = {};
   const missing: string[] = [];
   for (const [logical, expected] of Object.entries(LOGICAL_FIELDS) as Array<[Logical, string]>) {
     const f = byLower.get(expected);
@@ -278,6 +282,7 @@ async function layerSchema(token: string): Promise<LayerSchema> {
     else {
       fields[logical] = f.name;
       if (f.domain?.codedValues) domains[logical] = f.domain.codedValues.map((c) => String(c.code));
+      if (typeof f.length === "number" && f.length > 0) lengths[logical] = f.length;
     }
   }
   if (missing.length) throw new LaisConfigurationError(`The Plot layer is missing fields: ${missing.join(", ")}`);
@@ -285,7 +290,7 @@ async function layerSchema(token: string): Promise<LayerSchema> {
     const codes = domains[logical];
     if (codes && !codes.includes(code)) throw new LaisConfigurationError(`Domain of ${fields[logical]} has no '${code}' code.`);
   }
-  const value: LayerSchema = { objectIdField: String(meta.objectIdField ?? "objectid"), fields, domains };
+  const value: LayerSchema = { objectIdField: String(meta.objectIdField ?? "objectid"), fields, domains, lengths };
   schemaCache = { value, at: Date.now() };
   return value;
 }
@@ -665,6 +670,11 @@ export async function submitTransaction(token: string, input: LaisSubmission, li
     const shortName = entry?.versionName ? shortVersionName(entry.versionName) : versionNameFor(input);
     let version = await findVersion(token, shortName);
     const writeAttributes = config.LAIS_WRITE_MODE === "attributes";
+    // The API takes any length, but writing to the Plot (attributes mode) must fit its transaction_id field.
+    const idRoom = schema.lengths.transactionId;
+    if (writeAttributes && idRoom && input.Transaction_ID.length > idRoom && !entry?.attributesWritten) {
+      return { kind: "invalid", errors: [{ field: "Transaction_ID", code: "TOO_LONG_FOR_GIS", message: `GIS stores Transaction_ID on the parcel in a field of ${idRoom} characters; this one has ${input.Transaction_ID.length}. Contact the GIS integration administrator.` }] };
+    }
 
     if (entry?.versionName && !version) {
       // Its version was reconciled/posted or deleted by GIS: the transaction is closed. Never recreate it.

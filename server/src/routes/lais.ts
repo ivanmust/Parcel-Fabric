@@ -110,8 +110,8 @@ lais.post("/transactions", async (req, res) => {
 /** Status of a submitted transaction. */
 lais.get("/transactions/:transactionId", async (req, res) => {
   const id = String(req.params.transactionId ?? "").trim();
-  if (!id || id.length > 50) {
-    return laisFailure(req, res, 400, "A valid Transaction_ID is required.", [{ field: "Transaction_ID", code: "INVALID_TRANSACTION_ID", message: "Transaction_ID must be 1–50 characters." }]);
+  if (!id) {
+    return laisFailure(req, res, 400, "A valid Transaction_ID is required.", [{ field: "Transaction_ID", code: "INVALID_TRANSACTION_ID", message: "Give the Transaction_ID in the path." }]);
   }
   let outcome;
   try {

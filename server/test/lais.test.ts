@@ -42,7 +42,7 @@ interface Call { url: string; params: Record<string, string>; referer: string | 
 interface FakeVersion { name: string; guid: string; access: string; saved: Map<number, Attrs>; pending: Map<number, Attrs> | null }
 
 const FIELDS = [
-  { name: "objectid" }, { name: "name" }, { name: "transaction_id" },
+  { name: "objectid" }, { name: "name" }, { name: "transaction_id", length: 50 },
   { name: "transaction_type", domain: { codedValues: ["Subdivision", "Merge", "CorrectBoundaries", "CreatePlot"].map((code) => ({ code })) } },
   { name: "transaction_status", domain: { codedValues: ["New", "InProgress", "Approved", "Rejected"].map((code) => ({ code })) } },
   { name: "transaction_date" },
@@ -296,9 +296,9 @@ describe("validation (no GIS calls)", () => {
     assert.deepEqual(codes(r.body), ["UNKNOWN_FIELD", "UNKNOWN_FIELD"]);
   });
   test("bad type, status, UPI, date, length", async () => {
-    const r = await submit({ UPI: "abc", Transaction_ID: "X".repeat(51), Transaction_Type: "Sell", Transaction_Date: "2026-02-30T08:30:00+02:00", Transaction_Status: "Done" });
+    const r = await submit({ UPI: "1/02/13/02/" + "1".repeat(95), Transaction_ID: "X1", Transaction_Type: "Sell", Transaction_Date: "2026-02-30T08:30:00+02:00", Transaction_Status: "Done" });
     assert.equal(r.status, 422);
-    assert.deepEqual(codes(r.body).sort(), ["INVALID_DATE", "INVALID_TRANSACTION_STATUS", "INVALID_TRANSACTION_TYPE", "INVALID_UPI_FORMAT", "TOO_LONG"]);
+    assert.deepEqual(codes(r.body).sort(), ["INVALID_DATE", "INVALID_TRANSACTION_STATUS", "INVALID_TRANSACTION_TYPE", "TOO_LONG"]);
     assert.equal(fake.calls.length, 0);
   });
   test("wrong JSON types → INVALID_TYPE; date without timezone → INVALID_DATE", async () => {
@@ -619,6 +619,26 @@ describe("several parcels: UPIs (Merge, CorrectBoundaries, CreatePlot)", () => {
     assert.equal(r.body.data.version_name, "svc_lais.CRPL-NEW-1-20261125");
     assert.match(gisCalls("/create")[0]!.params.description!, /new plot/);
     assert.equal(gisCalls("/applyEdits").length, 0);
+  });
+});
+
+describe("Transaction_ID has no maximum length", () => {
+  const longId = "CASE-" + "1234567890".repeat(12); // 125 characters
+  test("a long Transaction_ID is accepted; the version name is shortened to 62 characters", async () => {
+    cfg.LAIS_WRITE_MODE = "version-only";
+    const r = await submit({ ...valid, Transaction_ID: longId });
+    assert.equal(r.status, 201, JSON.stringify(r.body));
+    assert.equal(r.body.data.Transaction_ID, longId);
+    const short = r.body.data.version_name.split(".").pop();
+    assert.ok(short.length <= 62 && /^SUBV-CASE-1234567890.*-20261124$/.test(short), short);
+    const s = await fetch(`${base}/transactions/${encodeURIComponent(longId)}`, { headers: { "x-api-key": KEY, ...client() } });
+    assert.equal(s.status, 200);
+  });
+  test("attributes mode refuses an ID longer than the Plot's transaction_id field, before creating anything", async () => {
+    const r = await submit({ ...valid, Transaction_ID: longId });
+    assert.equal(r.status, 422);
+    assert.deepEqual(codes(r.body), ["TOO_LONG_FOR_GIS"]);
+    assert.equal(gisCalls("/create").length, 0);
   });
 });
 

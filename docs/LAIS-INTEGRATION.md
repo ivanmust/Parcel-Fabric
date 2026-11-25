@@ -49,7 +49,7 @@ Status `stage`: `InReview` (version exists), `Posted` (fields found in sde.DEFAU
 
 | Field | Value |
 | --- | --- |
-| `transaction_id` | LAIS `Transaction_ID` (≤ 50) |
+| `transaction_id` | LAIS `Transaction_ID` (the API takes any length; this field holds 50, so attributes mode refuses longer IDs with `TOO_LONG_FOR_GIS`) |
 | `transaction_type` | `Transaction_Type` — domain KGL_TransactionType |
 | `transaction_status` | `Transaction_Status` **only if LAIS sends it** — domain KGL_TransactionStatus |
 | `transaction_date` | `Transaction_Date` (stored as UTC) |

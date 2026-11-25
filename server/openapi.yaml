@@ -258,7 +258,7 @@ paths:
         - name: transactionId
           in: path
           required: true
-          schema: { type: string, minLength: 1, maxLength: 50 }
+          schema: { type: string, minLength: 1 }
       responses:
         "200":
           description: Transaction found
@@ -350,7 +350,7 @@ components:
 
   responses:
     LaisFailure:
-      description: "Not recorded. errors[].code says why: REQUIRED_FIELD, INVALID_TYPE, TOO_LONG, UNKNOWN_FIELD, INVALID_UPI_FORMAT, INVALID_FORMAT, INVALID_TRANSACTION_TYPE, INVALID_TRANSACTION_STATUS, INVALID_DATE, PARCEL_NOT_FOUND, UPI_EXPIRED (replacedBy lists the current UPIs), UPI_NOT_UNIQUE, NOT_NEIGHBOURS, MERGE_NEEDS_TWO_UPIS, SUBDIVISION_NEEDS_ONE_UPI, CONFLICTING_FIELDS, DUPLICATE_UPI, DUPLICATE_TRANSACTION_ID, NOT_FOUND, INVALID_TRANSACTION_ID, UNAUTHORIZED, INVALID_JSON, PAYLOAD_TOO_LARGE, RATE_LIMITED, GIS_UNAVAILABLE, GIS_NOT_CONFIGURED, INTERNAL_ERROR."
+      description: "Not recorded. errors[].code says why: REQUIRED_FIELD, INVALID_TYPE, TOO_LONG, TOO_LONG_FOR_GIS (attributes mode only), UNKNOWN_FIELD, INVALID_UPI_FORMAT, INVALID_FORMAT, INVALID_TRANSACTION_TYPE, INVALID_TRANSACTION_STATUS, INVALID_DATE, PARCEL_NOT_FOUND, UPI_EXPIRED (replacedBy lists the current UPIs), UPI_NOT_UNIQUE, NOT_NEIGHBOURS, MERGE_NEEDS_TWO_UPIS, SUBDIVISION_NEEDS_ONE_UPI, CONFLICTING_FIELDS, DUPLICATE_UPI, DUPLICATE_TRANSACTION_ID, NOT_FOUND, INVALID_TRANSACTION_ID, UNAUTHORIZED, INVALID_JSON, PAYLOAD_TOO_LARGE, RATE_LIMITED, GIS_UNAVAILABLE, GIS_NOT_CONFIGURED, INTERNAL_ERROR."
       content:
         application/json:
           schema:
@@ -415,7 +415,7 @@ components:
       properties:
         UPI: { type: string, maxLength: 100, pattern: '^\d/\d{2}/\d{2}/\d{2}/\d+$', example: "1/02/13/02/1001" }
         UPIs: { type: array, maxItems: 20, uniqueItems: true, items: { type: string, maxLength: 100, pattern: '^\d/\d{2}/\d{2}/\d{2}/\d+$' }, example: ["1/02/13/02/2679", "1/02/13/02/2682"] }
-        Transaction_ID: { type: string, minLength: 1, maxLength: 50, pattern: '^[A-Za-z0-9][A-Za-z0-9._:/-]*$', example: "LAIS-SUB-2026-00125" }
+        Transaction_ID: { type: string, minLength: 1, description: "No maximum length; it is the CASE_NUMBER in the version name {TYPE}-{CASE_NUMBER}-{DATE}", pattern: '^[A-Za-z0-9][A-Za-z0-9._:/-]*$', example: "LAIS-SUB-2026-00125" }
         Transaction_Type: { type: string, enum: [Subdivision, Merge, CorrectBoundaries, CreatePlot] }
         Transaction_Date: { type: string, format: date-time, description: "ISO 8601 with an explicit timezone", example: "2026-11-24T08:30:00+02:00" }
         Transaction_Status: { type: string, enum: [New, InProgress, Approved, Rejected], description: "Optional. Written to the Plot only when sent." }
