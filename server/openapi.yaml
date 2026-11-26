@@ -246,12 +246,70 @@ paths:
         "502": { $ref: "#/components/responses/LaisFailure" }
         "503": { $ref: "#/components/responses/LaisFailure" }
 
+    get:
+      tags: [LAIS]
+      operationId: listLaisTransactions
+      summary: All LAIS transactions, for the LAIS dashboard
+      description: |
+        Every transaction this API accepted, oldest change first, each in the same shape as
+        `GET /lais/transactions/{transactionId}`. Transactions that can still change (`InReview`, `Closed`,
+        or `Posted` with warnings) are checked against GIS first; settled ones come from the API's records.
+
+        **Polling.** Call once without `updatedSince`, then each time with `updatedSince` set to the previous
+        response's `next_updated_since`: you get only transactions whose `stage`, `result` or `warnings`
+        changed. A transaction may come twice; never zero times. When `has_more` is true, call again at once
+        with the new `next_updated_since` for the rest.
+      security:
+        - laisApiKey: []
+      parameters:
+        - name: updatedSince
+          in: query
+          description: ISO 8601 with a timezone. Only transactions whose reported state changed at or after this time.
+          schema: { type: string, format: date-time }
+          example: "2026-11-26T08:00:00Z"
+        - name: stage
+          in: query
+          schema: { type: string, enum: [InReview, Posted, Closed] }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 100 }
+      responses:
+        "200":
+          description: Transactions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, const: true }
+                  case: { type: string, const: "Yes" }
+                  message: { type: string }
+                  data:
+                    type: object
+                    properties:
+                      transactions: { type: array, items: { $ref: "#/components/schemas/LaisTransaction" } }
+                      has_more: { type: boolean }
+                      next_updated_since: { type: string, format: date-time, description: "Pass as updatedSince on the next call" }
+        "400": { $ref: "#/components/responses/LaisFailure" }
+        "401": { $ref: "#/components/responses/LaisFailure" }
+        "429": { $ref: "#/components/responses/LaisFailure" }
+        "502": { $ref: "#/components/responses/LaisFailure" }
+        "503": { $ref: "#/components/responses/LaisFailure" }
+
   /lais/transactions/{transactionId}:
     get:
       tags: [LAIS]
       operationId: getLaisTransaction
-      summary: Status of a submitted LAIS transaction
-      description: "`stage` is `InReview` while the transaction is in its LAIS version and `Posted` once it is in sde.DEFAULT."
+      summary: Status of a submitted LAIS transaction, and its resulting parcels once posted
+      description: |
+        `stage`:
+        - `InReview`: GIS has not finished it. The change is not in sde.DEFAULT yet.
+        - `Posted`: GIS edited the parcels and posted the version, so the change is in sde.DEFAULT. `result` lists
+          the resulting parcels (new UPIs, area, location), the retired parcels (expired UPIs) and the Parcel
+          Fabric record. Their attributes are read from GIS on every call, so a UPI that GIS assigns later appears.
+        - `Closed`: the version was removed without the change reaching sde.DEFAULT (cancelled in GIS).
+
+        `warnings` while `Posted`: `UPI_MISSING` (a resulting parcel has no UPI yet), `NO_RESULT_PARCELS`.
       security:
         - laisApiKey: []
       parameters:
@@ -426,20 +484,73 @@ components:
         case: { type: string, const: "Yes" }
         message: { type: string }
         data:
-          type: object
-          properties:
-            UPI: { type: [string, "null"], description: "The first parcel (kept for single-parcel clients)" }
-            UPIs: { type: array, items: { type: string }, description: "All parcels of the transaction" }
-            Transaction_ID: { type: string }
-            Transaction_Type: { type: string }
-            Transaction_Status: { type: [string, "null"] }
-            Transaction_Date: { type: string, format: date-time, description: "Normalised to UTC" }
-            case: { type: string, const: "Yes" }
-            validation_message: { type: string }
-            version_name: { type: string, example: "svc_lais.SUBV-LAIS-SUB-2026-00125-20261124" }
-            version_status: { type: string, enum: [Pending, VersionCreated] }
-            stage: { type: string, enum: [InReview, Posted] }
-            duplicate: { type: boolean, description: "Present on an identical retry" }
+          allOf:
+            - $ref: "#/components/schemas/LaisTransaction"
+            - type: object
+              properties:
+                duplicate: { type: boolean, description: "Present on an identical retry" }
+    LaisTransaction:
+      type: object
+      properties:
+        UPI: { type: [string, "null"], description: "The first parcel LAIS sent (kept for single-parcel clients)" }
+        UPIs: { type: array, items: { type: string }, description: "The parcels LAIS sent" }
+        Transaction_ID: { type: string }
+        Transaction_Type: { type: string }
+        Transaction_Status: { type: [string, "null"] }
+        Transaction_Date: { type: string, format: date-time, description: "Normalised to UTC" }
+        case: { type: string, const: "Yes" }
+        validation_message: { type: string }
+        version_name: { type: string, example: "svc_lais.SUBV-LAIS-SUB-2026-00125-20261124" }
+        version_status: { type: string, enum: [Pending, VersionCreated] }
+        stage: { type: string, enum: [InReview, Posted, Closed] }
+        result:
+          description: "Set when stage is Posted: what GIS changed"
+          oneOf:
+            - type: "null"
+            - $ref: "#/components/schemas/LaisResult"
+        warnings:
+          type: array
+          items:
+            type: object
+            properties:
+              code: { type: string, enum: [UPI_MISSING, NO_RESULT_PARCELS] }
+              message: { type: string }
+        updated_at: { type: [string, "null"], format: date-time, description: "When stage, result or warnings last changed" }
+    LaisResult:
+      type: object
+      properties:
+        parcels:
+          type: array
+          description: The parcels the transaction produced (Merge, Subdivision, CreatePlot) or corrected in place (CorrectBoundaries)
+          items:
+            type: object
+            properties:
+              UPI: { type: [string, "null"], description: "null until GIS assigns it (warning UPI_MISSING)" }
+              current: { type: boolean, description: "false if GIS has retired this parcel since (a later merge or subdivision)" }
+              area_sqm: { type: [number, "null"] }
+              province: { type: [string, "null"] }
+              district: { type: [string, "null"] }
+              sector: { type: [string, "null"] }
+              cell: { type: [string, "null"] }
+              village: { type: [string, "null"] }
+        retired_parcels:
+          type: array
+          description: The parcels the transaction ended. Their UPIs have expired.
+          items: { type: object, properties: { UPI: { type: [string, "null"] } } }
+        records:
+          type: array
+          description: The Parcel Fabric record(s) of the change
+          items: { type: object, properties: { name: { type: [string, "null"] }, recorded_date: { type: [string, "null"], format: date-time } } }
+        completed_at: { type: [string, "null"], format: date-time, description: "Latest GIS edit of these parcels" }
+        detected_at: { type: string, format: date-time, description: "When this API first found the change in sde.DEFAULT" }
+      example:
+        parcels:
+          - { UPI: "1/02/08/01/18372", current: true, area_sqm: 1570.96, province: null, district: null, sector: null, cell: null, village: null }
+          - { UPI: "1/02/08/01/18373", current: true, area_sqm: 1570.96, province: null, district: null, sector: null, cell: null, village: null }
+        retired_parcels: [{ UPI: "1/02/08/01/18371" }]
+        records: [{ name: "SUBV-000008-20261120", recorded_date: "2026-11-20T00:00:00.000Z" }]
+        completed_at: "2026-11-25T08:37:13.000Z"
+        detected_at: "2026-11-26T08:07:26.559Z"
     Error:
       type: object
       required: [error]

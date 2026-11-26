@@ -16,6 +16,7 @@ const PORTAL = "https://fake-gis.test/portal";
 const SERVER = "https://fake-gis.test/server";
 const PLOT = `${SERVER}/rest/services/ParcelFabric/FeatureServer/17`;
 const VMS = `${SERVER}/rest/services/ParcelFabric/VersionManagementServer`;
+const RECORDS = `${SERVER}/rest/services/ParcelFabric/FeatureServer/2`;
 const REFERER = "https://gis-api.test";
 const OWNER = "svc_lais";
 const auditDir = mkdtempSync(path.join(tmpdir(), "lais-audit-"));
@@ -52,11 +53,18 @@ const FIELDS = [
   { name: "version_name" },
   { name: "retiredbyrecord" },
   { name: "createdbyrecord" },
+  { name: "size" },
+  { name: "Shape__Area" },
+  { name: "district" },
+  { name: "last_edited_date" },
 ];
+const RECORD_FIELDS = [{ name: "objectid" }, { name: "name" }, { name: "recordeddate" }, { name: "globalid" }, { name: "transaction_id" }];
 
 const fake = {
   calls: [] as Call[],
   plots: new Map<number, Attrs>(),
+  /** Parcel Fabric records in DEFAULT (a record reaches DEFAULT when its version is posted). */
+  records: [] as Attrs[],
   versions: [] as FakeVersion[],
   branchVersioned: true,
   failNextApplyEdits: false,
@@ -79,6 +87,7 @@ const fake = {
       [9, { objectid: 9, name: "1/02/13/02/9009" }],
       [10, { objectid: 10, name: "1/02/13/02/1010" }],
     ]);
+    this.records = [];
     this.versions = [];
     this.branchVersioned = true;
     this.failNextApplyEdits = false;
@@ -110,6 +119,8 @@ const BOXES: Record<number, Box> = {
   1: [0, 0, 10, 10], 4: [10, 0, 20, 10], 9: [20, 0, 30, 10], 10: [10, 10, 20, 20],
   8: [100, 100, 110, 110], 2: [300, 0, 310, 10], 3: [320, 0, 330, 10],
   5: [200, 0, 210, 10], 6: [0, 0, 10, 10], 7: [200, 0, 220, 10],
+  // parcels the completion tests "post": 11+12 split 1; 13 is 1+4 merged; 14 a new plot far away
+  11: [0, 0, 5, 10], 12: [5, 0, 10, 10], 13: [0, 0, 20, 10], 14: [500, 500, 510, 510],
 };
 const ringsOf = ([x0, y0, x1, y1]: Box) => ({ rings: [[[x0, y0], [x0, y1], [x1, y1], [x1, y0], [x0, y0]]] });
 const boxOf = (ring: number[][]): Box => [Math.min(...ring.map((p) => p[0]!)), Math.min(...ring.map((p) => p[1]!)), Math.max(...ring.map((p) => p[0]!)), Math.max(...ring.map((p) => p[1]!))];
@@ -123,7 +134,16 @@ function relates(a: Box, b: Box, relation: string): boolean {
 }
 
 function where(clause: string): (a: Attrs) => boolean {
+  const alternatives = clause.split(" OR ").map(conjunction);
+  return (a) => alternatives.some((t) => t(a));
+}
+function conjunction(clause: string): (a: Attrs) => boolean {
   const tests = clause.split(" AND ").map((part) => {
+    const upperIn = /^UPPER\((\w+)\) IN \((.*)\)$/.exec(part);
+    if (upperIn) {
+      const values = [...upperIn[2]!.matchAll(/'((?:[^']|'')*)'/g)].map((m) => m[1]!.replace(/''/g, "'"));
+      return (a: Attrs) => values.includes(String(a[upperIn[1]!] ?? "").toUpperCase());
+    }
     const eq = /^(\w+) = '((?:[^']|'')*)'$/.exec(part);
     if (eq) return (a: Attrs) => a[eq[1]!] === eq[2]!.replace(/''/g, "'");
     const isNull = /^(\w+) IS (NOT )?NULL$/.exec(part);
@@ -153,7 +173,15 @@ globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) =>
     fake.expireTokenOnce = false;
     return json({ error: { code: 498, message: "Invalid token." } });
   }
-  if (url === PLOT) return json({ name: "Plot", isDataBranchVersioned: fake.branchVersioned, objectIdField: "objectid", fields: FIELDS });
+  if (url === PLOT) {
+    return json({
+      name: "Plot", isDataBranchVersioned: fake.branchVersioned, objectIdField: "objectid", fields: FIELDS,
+      editFieldsInfo: { editDateField: "last_edited_date" },
+      relationships: [{ keyField: "CreatedByRecord", relatedTableId: 2 }],
+    });
+  }
+  if (url === RECORDS) return json({ name: "Records", objectIdField: "objectid", globalIdField: "globalid", fields: RECORD_FIELDS });
+  if (url === `${RECORDS}/query`) return json({ features: fake.records.filter(where(params.where!)).map((attributes) => ({ attributes })) });
   if (url === `${PLOT}/query`) {
     const match = where(params.where!);
     let rows = [...viewOf(params.gdbVersion).values()].filter(match);
@@ -675,6 +703,158 @@ describe("status endpoint", () => {
     body = (await res.json()) as Record<string, any>;
     assert.equal(res.status, 404);
     assert.deepEqual(codes(body), ["NOT_FOUND"]);
+  });
+});
+
+describe("completion: LAIS sees when GIS has posted the change, and the resulting parcels", () => {
+  beforeEach(() => {
+    cfg.LAIS_WRITE_MODE = "version-only"; // works without the editing licence
+  });
+  const get = async (pathAndQuery: string) => {
+    const res = await fetch(`${base}${pathAndQuery}`, { headers: { "x-api-key": KEY, ...client() } });
+    return { status: res.status, body: (await res.json()) as Record<string, any> };
+  };
+  const status = (id: string) => get(`/transactions/${encodeURIComponent(id)}`);
+  const EDITED = Date.parse("2026-11-26T09:15:00Z");
+  /** What an editor's Subdivision of plot 1 looks like in DEFAULT after Reconcile & Post. */
+  function postSubdivision(secondUpi: string | null) {
+    Object.assign(fake.plots.get(1)!, { retiredbyrecord: "{SUB-REC}", last_edited_date: EDITED });
+    fake.plots.set(11, { objectid: 11, name: "1/02/13/02/1101", createdbyrecord: "{SUB-REC}", size: 500.123, district: "Gasabo", last_edited_date: EDITED });
+    fake.plots.set(12, { objectid: 12, name: secondUpi, createdbyrecord: "{SUB-REC}", size: 589.8, district: "Gasabo", last_edited_date: EDITED });
+    fake.records.push({ globalid: "{SUB-REC}", name: "SUBV-LAIS-SUB-2026-00125-20261124", recordeddate: Date.parse("2026-11-26T00:00:00Z") });
+  }
+
+  test("not yet posted → InReview with no result", async () => {
+    await submit(valid);
+    const s = await status(valid.Transaction_ID);
+    assert.equal(s.body.data.stage, "InReview");
+    assert.equal(s.body.data.result, null);
+    assert.deepEqual(s.body.data.warnings, []);
+    assert.ok(s.body.data.updated_at);
+  });
+
+  test("Subdivision posted and its version deleted → Posted with the new parcels; UPI_MISSING until GIS assigns it", async () => {
+    await submit(valid);
+    postSubdivision(null);
+    fake.versions = [];
+    let s = await status(valid.Transaction_ID);
+    assert.equal(s.status, 200, JSON.stringify(s.body));
+    assert.equal(s.body.data.stage, "Posted");
+    const result = s.body.data.result;
+    assert.deepEqual(result.parcels.map((p: any) => p.UPI), ["1/02/13/02/1101", null]);
+    assert.deepEqual(result.parcels[0], { UPI: "1/02/13/02/1101", current: true, area_sqm: 500.12, province: null, district: "Gasabo", sector: null, cell: null, village: null });
+    assert.deepEqual(result.retired_parcels, [{ UPI: valid.UPI }]);
+    assert.deepEqual(result.records, [{ name: "SUBV-LAIS-SUB-2026-00125-20261124", recorded_date: "2026-11-26T00:00:00.000Z" }]);
+    assert.equal(result.completed_at, new Date(EDITED).toISOString());
+    assert.deepEqual(s.body.data.warnings.map((w: any) => w.code), ["UPI_MISSING"]);
+    const firstUpdate = s.body.data.updated_at;
+
+    // asking again without a change does not move updated_at
+    s = await status(valid.Transaction_ID);
+    assert.equal(s.body.data.updated_at, firstUpdate);
+
+    // GIS assigns the missing UPI: the warning goes and updated_at moves
+    await new Promise((r) => setTimeout(r, 5));
+    fake.plots.get(12)!.name = "1/02/13/02/1102";
+    s = await status(valid.Transaction_ID);
+    assert.deepEqual(s.body.data.result.parcels.map((p: any) => p.UPI), ["1/02/13/02/1101", "1/02/13/02/1102"]);
+    assert.deepEqual(s.body.data.warnings, []);
+    assert.ok(Date.parse(s.body.data.updated_at) > Date.parse(firstUpdate));
+  });
+
+  test("resubmitting a posted Subdivision → 200 duplicate Posted, not UPI_EXPIRED", async () => {
+    await submit(valid);
+    postSubdivision("1/02/13/02/1102");
+    const r = await submit(valid);
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    assert.equal(r.body.data.duplicate, true);
+    assert.equal(r.body.data.stage, "Posted");
+    assert.equal(r.body.data.result.parcels.length, 2);
+  });
+
+  test("Merge found through Parcel Fabric lineage, with the version still kept after posting", async () => {
+    const merge = { UPIs: ["1/02/13/02/1001", "1/02/13/02/3003"], Transaction_ID: "MRG-2", Transaction_Type: "Merge", Transaction_Date: "2026-11-26T10:00:00+02:00" };
+    assert.equal((await submit(merge)).status, 201);
+    for (const id of [1, 4]) fake.plots.get(id)!.retiredbyrecord = "{MRG-REC}";
+    // a parcel made in the editor has no `size` yet: the area comes from the shape
+    fake.plots.set(13, { objectid: 13, name: "1/02/13/02/1313", createdbyrecord: "{MRG-REC}", size: null, Shape__Area: 2000.456 });
+    // no record named for the version: the lineage alone tells
+    const s = await status("MRG-2");
+    assert.equal(s.body.data.stage, "Posted");
+    assert.deepEqual(s.body.data.result.parcels.map((p: any) => p.UPI), ["1/02/13/02/1313"]);
+    assert.equal(s.body.data.result.parcels[0].area_sqm, 2000.46);
+    assert.deepEqual(s.body.data.result.retired_parcels.map((p: any) => p.UPI).sort(), merge.UPIs);
+    assert.equal(fake.versions.length, 1, "the API never deletes versions");
+  });
+
+  test("CreatePlot without a parent: found through the record named for its version (any case)", async () => {
+    await submit({ Transaction_ID: "NEW-2", Transaction_Type: "CreatePlot", Transaction_Date: "2026-11-25T10:00:00Z" });
+    assert.equal((await status("NEW-2")).body.data.stage, "InReview");
+    fake.records.push({ globalid: "{NEW-REC}", name: "crpl-new-2-20261125" });
+    fake.plots.set(14, { objectid: 14, name: "1/02/13/02/1414", createdbyrecord: "{NEW-REC}" });
+    const s = await status("NEW-2");
+    assert.equal(s.body.data.stage, "Posted");
+    assert.deepEqual(s.body.data.result.parcels.map((p: any) => p.UPI), ["1/02/13/02/1414"]);
+    assert.deepEqual(s.body.data.result.retired_parcels, []);
+  });
+
+  test("CorrectBoundaries edited in place: its posted record → Posted with the corrected parcel", async () => {
+    await submit({ UPI: "1/02/13/02/3003", Transaction_ID: "COR-1", Transaction_Type: "CorrectBoundaries", Transaction_Date: "2026-11-26T10:00:00Z" });
+    fake.records.push({ globalid: "{COR-REC}", name: "CORB-COR-1-20261126" });
+    const s = await status("COR-1");
+    assert.equal(s.body.data.stage, "Posted");
+    assert.deepEqual(s.body.data.result.parcels.map((p: any) => p.UPI), ["1/02/13/02/3003"]);
+    assert.deepEqual(s.body.data.warnings, []);
+  });
+
+  test("version deleted without posting → Closed", async () => {
+    await submit(valid);
+    fake.versions = [];
+    const s = await status(valid.Transaction_ID);
+    assert.equal(s.body.data.stage, "Closed");
+    assert.equal(s.body.data.result, null);
+  });
+
+  test("list: all transactions oldest change first, stage filter, polling with next_updated_since", async () => {
+    await submit(valid);
+    await submit({ Transaction_ID: "NEW-3", Transaction_Type: "CreatePlot", Transaction_Date: "2026-11-25T10:00:00Z" });
+    let l = await get("/transactions");
+    assert.equal(l.status, 200, JSON.stringify(l.body));
+    assert.deepEqual(l.body.data.transactions.map((t: any) => t.stage), ["InReview", "InReview"]);
+    assert.equal(l.body.data.has_more, false);
+    const since = l.body.data.next_updated_since;
+
+    l = await get(`/transactions?updatedSince=${encodeURIComponent(since)}`);
+    assert.deepEqual(l.body.data.transactions, [], "nothing changed since");
+
+    await new Promise((r) => setTimeout(r, 5));
+    postSubdivision("1/02/13/02/1102");
+    l = await get(`/transactions?updatedSince=${encodeURIComponent(since)}`);
+    assert.deepEqual(l.body.data.transactions.map((t: any) => `${t.Transaction_ID}:${t.stage}`), [`${valid.Transaction_ID}:Posted`]);
+    assert.equal(l.body.data.transactions[0].result.parcels.length, 2);
+
+    l = await get("/transactions?stage=inreview");
+    assert.deepEqual(l.body.data.transactions.map((t: any) => t.Transaction_ID), ["NEW-3"]);
+    l = await get("/transactions?limit=1");
+    assert.equal(l.body.data.transactions.length, 1);
+    assert.equal(l.body.data.has_more, true);
+    assert.equal(l.body.data.next_updated_since, l.body.data.transactions[0].updated_at);
+  });
+
+  test("list: a settled transaction is answered from the ledger without asking GIS", async () => {
+    await submit(valid);
+    postSubdivision("1/02/13/02/1102");
+    await get("/transactions"); // finds it posted
+    fake.calls = [];
+    const l = await get("/transactions");
+    assert.equal(l.body.data.transactions[0].stage, "Posted");
+    assert.equal(gisCalls("/query").length, 0);
+  });
+
+  test("list: invalid query → 400 with one error per parameter", async () => {
+    const l = await get("/transactions?updatedSince=yesterday&stage=Done&limit=0&page=2");
+    assert.equal(l.status, 400);
+    assert.deepEqual(l.body.errors.map((e: any) => `${e.field}:${e.code}`).sort(), ["limit:INVALID_LIMIT", "page:UNKNOWN_FIELD", "stage:INVALID_STAGE", "updatedSince:INVALID_DATE"]);
   });
 });
 

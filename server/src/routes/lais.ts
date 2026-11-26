@@ -6,11 +6,15 @@ import { logger } from "../logging/logger.js";
 import { writeAudit } from "../audit/auditLog.js";
 import { withServiceToken } from "../lais/arcgisClient.js";
 import {
+  isValidTransactionDate,
   LaisConfigurationError,
+  listTransactions,
+  STAGES,
   submitTransaction,
   transactionStatus,
   validateSubmission,
   type FieldError,
+  type Stage,
 } from "../lais/laisService.js";
 
 /**
@@ -105,6 +109,49 @@ lais.post("/transactions", async (req, res) => {
       audit(req, input.Transaction_ID, "success", { UPIs: input.UPIs, version: outcome.record.version_name });
       return res.status(201).json({ success: true, case: "Yes", message: "Transaction validated and recorded in a GIS version for review.", data: outcome.record });
   }
+});
+
+const LIST_PARAMS = new Set(["updatedSince", "stage", "limit"]);
+
+/**
+ * All transactions for the LAIS dashboard, oldest change first. Poll with updatedSince = the previous
+ * response's next_updated_since to get only transactions whose stage, result or warnings changed.
+ */
+lais.get("/transactions", async (req, res) => {
+  const errors: FieldError[] = [];
+  const query = req.query as Record<string, unknown>;
+  for (const key of Object.keys(query)) {
+    if (!LIST_PARAMS.has(key)) errors.push({ field: key, code: "UNKNOWN_FIELD", message: `Unknown query parameter ${key}. Allowed: updatedSince, stage, limit.` });
+  }
+  const one = (key: string) => (typeof query[key] === "string" ? (query[key] as string).trim() : query[key] === undefined ? undefined : null);
+
+  const since = one("updatedSince");
+  let updatedSince: number | undefined;
+  if (since !== undefined) {
+    if (since && isValidTransactionDate(since)) updatedSince = Date.parse(since);
+    else errors.push({ field: "updatedSince", code: "INVALID_DATE", message: "Use an ISO 8601 date-time with an explicit timezone, for example 2026-11-26T08:30:00Z." });
+  }
+  const stageRaw = one("stage");
+  let stage: Stage | undefined;
+  if (stageRaw !== undefined) {
+    stage = STAGES.find((s) => s.toLowerCase() === String(stageRaw ?? "").toLowerCase());
+    if (!stage) errors.push({ field: "stage", code: "INVALID_STAGE", message: `Allowed values: ${STAGES.join(", ")}.` });
+  }
+  const limitRaw = one("limit");
+  let limit = 100;
+  if (limitRaw !== undefined) {
+    limit = /^\d+$/.test(String(limitRaw ?? "")) ? Number(limitRaw) : NaN;
+    if (!(limit >= 1 && limit <= 200)) errors.push({ field: "limit", code: "INVALID_LIMIT", message: "limit must be a whole number from 1 to 200." });
+  }
+  if (errors.length) return laisFailure(req, res, 400, "Invalid query", errors);
+
+  let outcome;
+  try {
+    outcome = await withServiceToken((token) => listTransactions(token, { updatedSince, stage, limit }));
+  } catch (error) {
+    throw gisFailure(error, undefined, "transaction list");
+  }
+  res.json({ success: true, case: "Yes", message: `${outcome.transactions.length} transaction(s).`, data: outcome });
 });
 
 /** Status of a submitted transaction. */

@@ -23,8 +23,28 @@ export interface LedgerEntry {
   versionName: string | null;
   /** True once the fields were also written on the Plot inside the version (attributes mode). */
   attributesWritten: boolean;
+  /**
+   * Set once the API finds the transaction's change in sde.DEFAULT (posted). Which parcels the change
+   * produced and retired is fixed from then on; their current attributes are re-read on every report.
+   */
+  completion?: Completion;
+  /** What LAIS was last told (without updated_at). `updatedAt` moves only when this changes. */
+  reported?: Record<string, unknown>;
   createdAt: string;
+  /** Last change of the entry, including of what LAIS sees (stage, result parcels, warnings). */
   updatedAt: string;
+}
+
+export interface Completion {
+  detectedAt: string;
+  /** How the change was found: a record named for the version, the parcels' retirement, or the posted fields. */
+  via: "record" | "lineage" | "fields";
+  /** Global ids of the Parcel Fabric records of the change. */
+  recordIds: string[];
+  /** Plots the change retired (historic now). */
+  retiredObjectIds: number[];
+  /** Plots the change produced or edited in place: the parcels LAIS now has. */
+  parcelObjectIds: number[];
 }
 
 const file = () => path.resolve(config.LAIS_DATA_DIR, "transactions.json");
@@ -66,11 +86,23 @@ export async function getEntry(transactionId: string): Promise<LedgerEntry | und
   return (await load()).get(key(transactionId));
 }
 
-export async function putEntry(entry: Omit<LedgerEntry, "createdAt" | "updatedAt"> & Partial<Pick<LedgerEntry, "createdAt">>): Promise<LedgerEntry> {
+export async function allEntries(): Promise<LedgerEntry[]> {
+  return [...(await load()).values()];
+}
+
+/** `keepUpdatedAt`: store without marking the entry changed (bookkeeping LAIS cannot see). */
+export async function putEntry(
+  entry: Omit<LedgerEntry, "createdAt" | "updatedAt"> & Partial<Pick<LedgerEntry, "createdAt">>,
+  options: { keepUpdatedAt?: boolean } = {},
+): Promise<LedgerEntry> {
   const map = await load();
   const now = new Date().toISOString();
   const previous = map.get(key(entry.Transaction_ID));
-  const full: LedgerEntry = { ...entry, createdAt: previous?.createdAt ?? entry.createdAt ?? now, updatedAt: now };
+  const full: LedgerEntry = {
+    ...entry,
+    createdAt: previous?.createdAt ?? entry.createdAt ?? now,
+    updatedAt: options.keepUpdatedAt && previous ? previous.updatedAt : now,
+  };
   map.set(key(entry.Transaction_ID), full);
   await persist();
   return full;

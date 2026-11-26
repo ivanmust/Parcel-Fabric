@@ -43,7 +43,23 @@ Put the old key in `LAIS_API_KEY_PREVIOUS` and the new one in `LAIS_API_KEY`, re
 - **`version-only` (current default):** the LAIS ArcGIS account only **reads** GIS and **creates** the public version (steps 1–4). It makes no edit calls, so it needs no editing licence. The accepted transaction is kept in the server ledger `server/data/lais/transactions.json` (idempotency, duplicate detection, status). The version description says `LAIS <type> UPI <upi> <Transaction_ID>`; the fields below are left for GIS editors.
 - **`attributes`:** additionally performs step 5 and writes the fields below on the Plot inside the version. Requires the Portal **Advanced Editing** user type extension on the LAIS account (without it ArcGIS refuses `startEditing`; the API then answers 503).
 
-Status `stage`: `InReview` (version exists), `Posted` (fields found in sde.DEFAULT), `Closed` (version no longer exists — reconciled/posted or deleted by GIS; a resubmission does not recreate it).
+## How LAIS learns that GIS finished (both write modes)
+
+LAIS asks; the API never calls LAIS. `GET /api/lais/transactions/{Transaction_ID}` for one transaction, or `GET /api/lais/transactions?updatedSince=…` for the dashboard (pass the previous response's `next_updated_since`; only transactions whose stage, result or warnings changed come back).
+
+`stage`:
+- `InReview`: the change is not in sde.DEFAULT yet.
+- `Posted`: an editor did the work in the version and Reconcile & Post put it in sde.DEFAULT. `result` gives the resulting `parcels` (UPI, area, location, `current`), the `retired_parcels` (expired UPIs) and the Parcel Fabric `records`. The parcels are fixed when the API first sees the change. Their attributes are re-read on every call, so a UPI that GIS assigns later shows up and the `UPI_MISSING` warning goes.
+- `Closed`: the version is gone and the change never reached sde.DEFAULT (cancelled). A resubmission does not recreate it.
+
+How the API finds the change, reading sde.DEFAULT only, with no licence needed:
+1. **The record named after the version.** Editors name the Parcel Fabric record like the version, e.g. record `SUBV-000008-20261120`; a record with the Transaction_ID in `transaction_id` also counts. A record reaches DEFAULT only when its version is posted. Its parcels are the ones it created; the ones it retired are history. This is the only signal for a CreatePlot without a parent.
+2. **Lineage.** The transaction's parcels (ObjectIDs kept at submission) are retired in DEFAULT. The result is the current parcels that the retiring record created over them.
+3. **CorrectBoundaries** edits parcels in place: its posted record, or in `attributes` mode its posted fields, means the corrected parcels are the result.
+
+**Editors:** name the record after the version, and run **Assign UPIs** before posting. Otherwise LAIS sees `UPI_MISSING`. A CorrectBoundaries without a record named after the version, posted in `version-only` mode, is never detected as Posted.
+
+`area_sqm` comes from `size`, or the shape area when `size` is empty. The location fields are empty on parcels the editor creates unless the editor fills them.
 
 ## Plot layer fields written (inside the version, `attributes` mode only)
 
