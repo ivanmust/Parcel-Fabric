@@ -27,7 +27,9 @@ info:
   license:
     name: Proprietary
 servers:
-  - url: /api
+  # Relative to this file (served at <base>/api/openapi.yaml), so "Try it out" keeps any reverse-proxy
+  # prefix: /api/... locally, /fabric/api/... behind https://esrirw.rw/fabric/.
+  - url: .
     description: This server
 tags:
   - name: System
