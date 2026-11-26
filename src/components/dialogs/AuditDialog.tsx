@@ -36,6 +36,7 @@ const CATEGORIES = [
   { value: "parcel-fabric.", label: "Parcel Fabric operations" },
   { value: "record.", label: "Records" },
   { value: "lais.", label: "LAIS API" },
+  { value: "webhook.", label: "Subdivision webhook" },
 ];
 
 const LABELS: Record<string, string> = {
@@ -53,6 +54,13 @@ const LABELS: Record<string, string> = {
   "lais.transaction.submit": "LAIS transaction",
   "lais.editing-done": "Editing done (to LAIS)",
   "lais.editing-done.delivery": "Notification to LAIS",
+  "lais.transaction.approve": "Registrar approval (LAIS)",
+  "lais.transaction.reject": "Registrar rejection (LAIS)",
+  "lais.transaction.post": "Posted after approval",
+  "webhook.event.created": "Subdivision event created",
+  "webhook.delivery": "Webhook delivery to App B",
+  "webhook.dead-letter": "Webhook dead-lettered",
+  "webhook.replay": "Webhook replayed",
 };
 
 /** Roles as shown; INTEGRATION is the LAIS API (a server, not a person). */
@@ -102,6 +110,19 @@ export function summarize(e: AuditEvent): string {
     if (d.status) parts.push(list(d.status));
     if (d.result) parts.push(list(d.result));
     if (d.message) parts.push(list(d.message));
+    if (d.code) parts.push(list(d.code));
+  } else if (e.action.startsWith("webhook.")) {
+    if (d.attempt !== undefined) parts.push(`attempt ${list(d.attempt)}`);
+    if (d.result) parts.push(list(d.result));
+    if (d.parcels) parts.push(`UPIs ${list(d.parcels)}`);
+    if (d.message) parts.push(list(d.message));
+    if (d.reason) parts.push(list(d.reason));
+    if (d.next_attempt_at) parts.push(`next try ${new Date(String(d.next_attempt_at)).toLocaleTimeString("en-GB")}`);
+  } else if (e.action === "lais.transaction.approve" || e.action === "lais.transaction.reject" || e.action === "lais.transaction.post") {
+    if (d.approved_by) parts.push(`by ${list(d.approved_by)}`);
+    if (d.rejected_by) parts.push(`by ${list(d.rejected_by)}`);
+    if (has(d.UPIs)) parts.push(`UPI ${list(d.UPIs)}`);
+    if (d.reason) parts.push(list(d.reason));
     if (d.code) parts.push(list(d.code));
   } else if (e.action === "lais.transaction.submit") {
     parts.push(has(d.UPIs) ? `UPI ${list(d.UPIs)}` : "no parcel");

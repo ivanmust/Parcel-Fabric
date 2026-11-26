@@ -103,8 +103,23 @@ export function LaisTransactionsDialog({ open, onClose }: { open: boolean; onClo
             {laisVersions.map((v) => {
               const isCurrent = current?.guid === v.versionIdentifier.guid;
               const tx = transactions.get(v.versionIdentifier.name.toLowerCase());
-              const status = enabled && tx ? describeStatus(tx.editing_done) : null;
-              const sent = tx?.editing_done?.status === "delivered" || tx?.editing_done?.status === "sending" || tx?.editing_done?.status === "retrying";
+              const status = enabled && tx ? describeStatus(tx.editing_done, tx.decision) : null;
+              const decided = tx?.decision?.kind === "approved" || tx?.decision?.kind === "approving";
+              const rejected = tx?.decision?.kind === "rejected";
+              const inFlight = tx?.editing_done?.status === "sending" || tx?.editing_done?.status === "retrying";
+              // Delivered and not rejected: only revised work can be sent (the server checks it changed).
+              const revision = tx?.editing_done?.status === "delivered" && !rejected;
+              const sendLabel = decided
+                ? "Approved by LAIS"
+                : inFlight
+                  ? "Sending to LAIS"
+                  : !isCurrent
+                    ? "Editing done (open the version first)"
+                    : rejected
+                      ? "Send the revised work to LAIS"
+                      : revision
+                        ? "Send a revision to LAIS (only if you changed the work)"
+                        : "Editing done: send to LAIS";
               return (
                 <calcite-list-item key={v.versionIdentifier.guid} label={v.versionIdentifier.name} description={status ? `${v.description ?? ""} · ${status.label}` : (v.description ?? "")}>
                   {isCurrent && (
@@ -132,8 +147,8 @@ export function LaisTransactionsDialog({ open, onClose }: { open: boolean; onClo
                     <calcite-action
                       slot="actions-end"
                       icon="send"
-                      text={sent ? "Already sent to LAIS" : isCurrent ? "Editing done: send to LAIS" : "Editing done (open the version first)"}
-                      disabled={!isCurrent || sent || tx.posted || undefined}
+                      text={sendLabel}
+                      disabled={!isCurrent || decided || inFlight || tx.posted || undefined}
                       onClick={() => setEditingDoneFor(tx)}
                     />
                   )}

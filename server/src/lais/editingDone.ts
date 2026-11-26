@@ -139,8 +139,15 @@ async function plots(token: string, schema: LayerSchema, where: string, gdbVersi
   return (body.features ?? []) as Array<{ attributes: Attributes; geometry?: { rings?: number[][][] } }>;
 }
 
+/** The work as LAIS reviews it: which parcels, with which areas (not their UPIs, which GIS gives at approval). */
+export const workFingerprint = (body: Pick<EditingDoneBody, "proposed_parcels" | "parent_parcels">) =>
+  JSON.stringify({
+    proposed: body.proposed_parcels.map((p) => `${p.parcel_ref.toUpperCase()}|${p.area_sqm}`).sort(),
+    parents: body.parent_parcels.map((p) => `${p.UPI}|${p.area_sqm}`).sort(),
+  });
+
 /** The transaction's work as it stands in its version, and whether it can be sent to LAIS. */
-async function buildFor(token: string, entry: LedgerEntry, editedBy: string, recordName?: string): Promise<Preview> {
+export async function buildFor(token: string, entry: LedgerEntry, editedBy: string, recordName?: string): Promise<Preview> {
   if (!entry.versionName) throw new EditingDoneError(409, "no_version", "GIS has not created a version for this transaction.");
   if (entry.completion) throw new EditingDoneError(409, "already_posted", "This transaction is already in the official data (posted).");
   const short = shortVersionName(entry.versionName);
@@ -298,7 +305,17 @@ export async function transactionsForEditors() {
       version_name: e.versionName,
       posted: !!e.completion,
       editing_done: viewOf(e.editingDone),
+      decision: decisionOf(e),
     }));
+}
+
+/** The registrar's decision on the work last sent: approved (with the UPIs), rejected (with the reason), or none yet. */
+function decisionOf(e: LedgerEntry) {
+  if (e.approval?.status === "approved") return { kind: "approved" as const, by: e.approval.approvedBy, at: e.approval.approvedAt, upis: e.approval.upis.map((u) => u.UPI), reason: null, error: null };
+  if (e.approval) return { kind: "approving" as const, by: e.approval.approvedBy, at: e.approval.requestedAt, upis: e.approval.upis.map((u) => u.UPI), reason: null, error: e.approval.lastError };
+  const last = e.editingDone && (e.rejections ?? []).find((r) => r.eventId === e.editingDone!.eventId);
+  if (last) return { kind: "rejected" as const, by: last.rejectedBy, at: last.at, upis: [], reason: last.reason, error: null };
+  return null;
 }
 
 // ---------------------------------------------------------------- sending
@@ -312,13 +329,18 @@ export async function requestEditingDone(token: string, transactionId: string, e
   const queued = await withLock(transactionId.toLowerCase(), async () => {
     const entry = await entryOrThrow(transactionId);
     const previous = entry.editingDone;
-    if (previous?.status === "delivered") {
-      throw new EditingDoneError(409, "already_sent", `LAIS already received this transaction's work on ${previous.deliveredAt}. Wait for the registrar's decision.`, viewOf(previous));
+    if (entry.approval?.status === "approved") {
+      throw new EditingDoneError(409, "already_approved", `The registrar approved this work on ${entry.approval.approvedAt} and GIS posted it.`, viewOf(previous));
     }
     if (previous && (previous.status === "sending" || previous.status === "retrying")) return { warnings: [], resend: false };
 
     const preview = await buildFor(token, entry, editedBy, recordName);
     if (!preview.payload) throw new EditingDoneError(422, "not_ready", preview.problems.join(" "), { problems: preview.problems, warnings: preview.warnings });
+    // LAIS has it and has not rejected it: send again only revised work (it replaces what LAIS reviews).
+    const rejected = !!previous && (entry.rejections ?? []).some((r) => r.eventId === previous.eventId);
+    if (previous?.status === "delivered" && !rejected && workFingerprint(preview.payload) === workFingerprint(previous.payload as unknown as EditingDoneBody)) {
+      throw new EditingDoneError(409, "already_sent", `LAIS already received this work on ${previous.deliveredAt}. Wait for the registrar's decision; change the work first to send a revision.`, viewOf(previous));
+    }
     const now = new Date().toISOString();
     const editingDone: EditingDone = {
       eventId: randomUUID(),

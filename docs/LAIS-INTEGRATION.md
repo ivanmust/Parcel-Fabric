@@ -66,8 +66,14 @@ How the API finds the change, reading sde.DEFAULT only, with no licence needed:
 The approval flow agreed with LAIS on 2026-11-26:
 1. LAIS submits the transaction; GIS creates its version (above).
 2. The GIS editor does the work in the version, saves it, and presses **Editing done** (Version Manager ▸ LAIS transactions). GIS sends the proposed parcels to an endpoint LAIS hosts. **Built.**
-3. The registrar approves in LAIS, which calls a GIS approve endpoint: GIS reconciles and posts the version and creates the new UPIs. **Not built yet:** the API's ArcGIS account needs the Advanced Editing licence to post and assign UPIs.
-4. The approve response returns the new UPIs, keyed by `parcel_ref`.
+3. The registrar decides in LAIS, which calls GIS (**built**, tested against the fake GIS; live posting needs the licence):
+   - `POST /api/lais/transactions/{id}/approve` `{ "event_id", "approved_by", "cell"? }`: GIS gives each new parcel its UPI inside the version (the next numbers of the parents' cell after the highest taken: by any parcel, current or historic, in sde.DEFAULT now or in the version — a version sees DEFAULT only as of its last reconcile — or reserved by another approval that has not finished; every page of the cell is read and checked against its count; approvals in one cell run one at a time), fills empty location fields from the parents, then reconciles and posts the version (conflicts abort; nothing is posted).
+   - `POST /api/lais/transactions/{id}/reject` `{ "event_id", "rejected_by", "reason" }`: recorded and shown to the editor, who revises the work in the same version and presses Editing done again (a new `event_id`). Nothing in GIS changes.
+4. The approve response is the transaction (stage `Posted`, result parcels) plus `approval.upis`: the UPI of each new parcel by `parcel_ref`.
+
+**Rules:** LAIS decides on one notification (`event_id`); an older one is `EVENT_MISMATCH`. If the editor changed the work after sending it, approve refuses (`CHANGED_SINCE_SUBMISSION`) and the editor sends the revision. A failed approval (`RECONCILE_CONFLICT`, `VERSION_IN_USE`, GIS down) can be repeated and reuses the same UPIs; a repeat after success is `409 ALREADY_APPROVED` with the UPIs in `data`. Parents in several cells (a Merge across cells) or a CreatePlot without parent and cell name: `CELL_REQUIRED`, approve again with `cell`. Audit: `lais.transaction.approve`, `lais.transaction.reject`, `lais.transaction.post`.
+
+**Licence:** the LAIS ArcGIS account needs the **Advanced Editing** user type extension; without it approve answers `503 GIS_NOT_CONFIGURED` and nothing is posted. Checked 2026-11-26 (evening): `qt_testing` now has it (GIS Professional Advanced, Publisher role); an edit in a version and a reconcile without post were accepted live, and a dry run on PS-E2E-LAIS-ED-192733 matched the work sent and would assign 1/02/13/02/3875–3876. The first real post is a change to DEFAULT: do it with QT on an agreed parcel.
 
 **Switch:** `LAIS_EDITING_DONE=false` by default. Keep it off until steps 2 and 3 both work end to end. With it on, Reconcile & post is not offered for LAIS versions (they are posted at approval), and the editors' Assign UPIs step moves to approval.
 

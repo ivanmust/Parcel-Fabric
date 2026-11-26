@@ -16,6 +16,8 @@ import {
   type FieldError,
   type Stage,
 } from "../lais/laisService.js";
+import { approveTransaction, CELL_PATTERN, DecisionError, rejectTransaction } from "../lais/approval.js";
+import { editingDoneEnabled } from "../lais/editingDone.js";
 
 /**
  * LAIS server-to-server API (mounted at /api/lais).
@@ -158,6 +160,104 @@ lais.get("/transactions", async (req, res) => {
     throw gisFailure(error, undefined, "transaction list");
   }
   res.json({ success: true, case: "Yes", message: `${outcome.transactions.length} transaction(s).`, data: outcome });
+});
+
+// ---------------------------------------------------------------- the registrar's decision
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Body checks in the LAIS error shape: unknown fields, required text, lengths. */
+function decisionBody(body: unknown, required: Record<string, number>, optional: Record<string, number> = {}): { values: Record<string, string>; errors: FieldError[] } {
+  const errors: FieldError[] = [];
+  const values: Record<string, string> = {};
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return { values, errors: [{ field: "body", code: "INVALID_BODY", message: "Send a JSON object." }] };
+  }
+  const input = body as Record<string, unknown>;
+  for (const key of Object.keys(input)) {
+    if (!(key in required) && !(key in optional)) errors.push({ field: key, code: "UNKNOWN_FIELD", message: `Unknown field ${key}. Allowed: ${[...Object.keys(required), ...Object.keys(optional)].join(", ")}.` });
+  }
+  for (const [key, max] of Object.entries({ ...required, ...optional })) {
+    const value = input[key];
+    if (value === undefined || value === null || (typeof value === "string" && !value.trim())) {
+      if (key in required) errors.push({ field: key, code: "REQUIRED", message: `${key} is required.` });
+      continue;
+    }
+    if (typeof value !== "string") errors.push({ field: key, code: "INVALID_TYPE", message: `${key} must be text.` });
+    else if (value.trim().length > max) errors.push({ field: key, code: "TOO_LONG", message: `${key} must be at most ${max} characters.` });
+    else values[key] = value.trim();
+  }
+  if (values.event_id && !UUID.test(values.event_id)) errors.push({ field: "event_id", code: "INVALID_EVENT_ID", message: "event_id is the UUID of the editing-done notification." });
+  if (values.cell && !CELL_PATTERN.test(values.cell)) errors.push({ field: "cell", code: "INVALID_CELL", message: "cell is a UPI prefix province/district/sector/cell, for example 1/02/13/02." });
+  return { values, errors };
+}
+
+function decisionAudit(req: Request, action: string, transactionId: string, outcome: "success" | "failure", details: Record<string, unknown>) {
+  void writeAudit({ username: "LAIS", appRole: "INTEGRATION", action, target: transactionId, outcome, details, ip: req.ip, requestId: String(req.id) }).catch(() => undefined);
+}
+
+function decisionFailure(req: Request, res: Response, error: DecisionError, field = "Transaction_ID") {
+  res.status(error.status).json({
+    success: false,
+    case: "No",
+    message: error.message,
+    errors: [{ field, code: error.code, message: error.message }],
+    ...(error.data ? { data: error.data } : {}),
+    requestId: req.id,
+  });
+}
+
+const flowOff = (req: Request, res: Response) =>
+  laisFailure(req, res, 409, "The approval flow is not switched on in GIS yet.", [{ field: "request", code: "FLOW_NOT_ENABLED", message: "GIS posts LAIS transactions itself until the approval flow is switched on (LAIS_EDITING_DONE)." }]);
+
+/**
+ * The registrar approved the work GIS sent (event_id): GIS assigns the new parcels' UPIs, posts the
+ * version to sde.DEFAULT and answers with the UPIs by parcel_ref. Safe to repeat after a failure.
+ */
+lais.post("/transactions/:transactionId/approve", async (req, res) => {
+  if (!editingDoneEnabled()) return flowOff(req, res);
+  const id = String(req.params.transactionId ?? "").trim();
+  const { values, errors } = decisionBody(req.body, { event_id: 36, approved_by: 100 }, { cell: 20 });
+  if (errors.length) {
+    decisionAudit(req, "lais.transaction.approve", id, "failure", { code: "VALIDATION_FAILED", errors: errors.map((e) => e.code) });
+    return laisFailure(req, res, 422, "Validation failed", errors);
+  }
+  let approval;
+  try {
+    approval = await withServiceToken((token) => approveTransaction(token, id, { eventId: values.event_id!, approvedBy: values.approved_by!, cell: values.cell }));
+  } catch (error) {
+    if (error instanceof DecisionError) {
+      decisionAudit(req, "lais.transaction.approve", id, "failure", { code: error.code, event_id: values.event_id, approved_by: values.approved_by });
+      return decisionFailure(req, res, error, error.code.startsWith("CELL") ? "cell" : error.code === "EVENT_MISMATCH" ? "event_id" : "Transaction_ID");
+    }
+    decisionAudit(req, "lais.transaction.approve", id, "failure", { code: "GIS_ERROR", event_id: values.event_id });
+    throw gisFailure(error, id, "approval");
+  }
+  decisionAudit(req, "lais.transaction.approve", id, "success", { event_id: approval.event_id, approved_by: approval.approved_by, UPIs: approval.upis.map((u) => u.UPI) });
+  // The transaction as LAIS sees it now (stage Posted, result parcels), plus the UPIs by parcel_ref.
+  const status = await withServiceToken((token) => transactionStatus(token, id)).catch(() => null);
+  const record = status?.kind === "found" ? status.record : null;
+  res.json({ success: true, case: "Yes", message: `Approved: GIS posted the change with ${approval.upis.length} parcel(s).`, data: { ...(record ?? { Transaction_ID: id }), approval } });
+});
+
+/** The registrar rejected the work GIS sent (event_id): recorded; the editor revises and sends it again. */
+lais.post("/transactions/:transactionId/reject", async (req, res) => {
+  if (!editingDoneEnabled()) return flowOff(req, res);
+  const id = String(req.params.transactionId ?? "").trim();
+  const { values, errors } = decisionBody(req.body, { event_id: 36, rejected_by: 100, reason: 1000 });
+  if (errors.length) {
+    decisionAudit(req, "lais.transaction.reject", id, "failure", { code: "VALIDATION_FAILED", errors: errors.map((e) => e.code) });
+    return laisFailure(req, res, 422, "Validation failed", errors);
+  }
+  try {
+    const rejection = await rejectTransaction(id, { eventId: values.event_id!, rejectedBy: values.rejected_by!, reason: values.reason! });
+    decisionAudit(req, "lais.transaction.reject", id, "success", { event_id: rejection.event_id, rejected_by: rejection.rejected_by, reason: rejection.reason });
+    res.json({ success: true, case: "Yes", message: "Rejection recorded. The GIS editor will revise the work and send it again.", data: { Transaction_ID: id, rejection } });
+  } catch (error) {
+    if (!(error instanceof DecisionError)) throw error;
+    decisionAudit(req, "lais.transaction.reject", id, "failure", { code: error.code, event_id: values.event_id });
+    decisionFailure(req, res, error, error.code === "EVENT_MISMATCH" ? "event_id" : "Transaction_ID");
+  }
 });
 
 /** Status of a submitted transaction. */

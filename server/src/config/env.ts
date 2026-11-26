@@ -52,6 +52,31 @@ const EnvSchema = z.object({
   /** The key LAIS issued to GIS, sent as X-API-Key. */
   LAIS_WEBHOOK_KEY: z.string().default(""),
   LAIS_WEBHOOK_TIMEOUT_MS: z.coerce.number().int().min(1000).max(60_000).default(10_000),
+  /**
+   * Subdivision completion webhook: when a LAIS Subdivision is posted in GIS, notify an external
+   * application ("App B") with the resulting parcels. Off by default; see docs/SUBDIVISION-WEBHOOK.md.
+   */
+  SUBDIVISION_WEBHOOK_ENABLED: z.enum(["true", "false"]).default("false"),
+  SUBDIVISION_WEBHOOK_URL: z.union([z.literal(""), z.url()]).default(""),
+  /** HMAC-SHA256 key shared with App B (at least 32 characters). */
+  SUBDIVISION_WEBHOOK_SECRET: z.string().default(""),
+  /** Only during a key change: the old key. Requests then carry a signature for each key. */
+  SUBDIVISION_WEBHOOK_SECRET_PREVIOUS: z.string().default(""),
+  SUBDIVISION_WEBHOOK_TIMEOUT_MS: z.coerce.number().int().min(1000).max(60_000).default(10_000),
+  /** Attempts before an event is dead-lettered (retryable failures; permanent ones dead-letter at once). */
+  SUBDIVISION_WEBHOOK_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(50).default(12),
+  /** Exponential backoff: base × 2^(attempt−1), capped, with jitter. */
+  SUBDIVISION_WEBHOOK_BACKOFF_BASE_MS: z.coerce.number().int().min(1000).default(30_000),
+  SUBDIVISION_WEBHOOK_BACKOFF_MAX_MS: z.coerce.number().int().min(1000).default(6 * 60 * 60_000),
+  /** How often GIS is checked for newly posted subdivisions. */
+  SUBDIVISION_WEBHOOK_RECONCILE_INTERVAL_MS: z.coerce.number().int().min(10_000).default(5 * 60_000),
+  /** How often due deliveries are sent. */
+  SUBDIVISION_WEBHOOK_DISPATCH_INTERVAL_MS: z.coerce.number().int().min(1000).default(15_000),
+  /**
+   * Only transactions accepted at or after this time are eligible (ISO 8601). Empty: from the moment
+   * the webhook was first enabled, so switching it on does not replay every past subdivision.
+   */
+  SUBDIVISION_WEBHOOK_SINCE: z.union([z.literal(""), z.iso.datetime({ offset: true })]).default(""),
   /** Serve the OpenAPI description and Swagger UI at /api/docs. Default: on, except in production. */
   API_DOCS: z.enum(["true", "false"]).optional(),
 });
@@ -85,6 +110,18 @@ function loadConfig(): AppConfig {
     throw new Error(`Invalid server configuration: ${issues}`);
   }
   const env = parsed.data;
+  if (env.SUBDIVISION_WEBHOOK_ENABLED === "true") {
+    const problems: string[] = [];
+    if (!env.SUBDIVISION_WEBHOOK_URL) problems.push("SUBDIVISION_WEBHOOK_URL is required");
+    else if (!env.SUBDIVISION_WEBHOOK_URL.startsWith("https://") && !/^http:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?\//.test(env.SUBDIVISION_WEBHOOK_URL)) {
+      problems.push("SUBDIVISION_WEBHOOK_URL must use https:// (http:// only for localhost)");
+    }
+    if (env.SUBDIVISION_WEBHOOK_SECRET.length < 32) problems.push("SUBDIVISION_WEBHOOK_SECRET must be at least 32 characters");
+    if (env.SUBDIVISION_WEBHOOK_SECRET_PREVIOUS && env.SUBDIVISION_WEBHOOK_SECRET_PREVIOUS.length < 32) problems.push("SUBDIVISION_WEBHOOK_SECRET_PREVIOUS must be empty or at least 32 characters");
+    if (env.SUBDIVISION_WEBHOOK_BACKOFF_MAX_MS < env.SUBDIVISION_WEBHOOK_BACKOFF_BASE_MS) problems.push("SUBDIVISION_WEBHOOK_BACKOFF_MAX_MS must not be below SUBDIVISION_WEBHOOK_BACKOFF_BASE_MS");
+    // Names only: the values may be secrets.
+    if (problems.length) throw new Error(`Invalid server configuration: ${problems.join("; ")}`);
+  }
   const base = `${env.ARCGIS_SERVER_URL}/rest/services/${env.PARCEL_SERVICE_PATH}`;
   const plotLayerUrl = trimSlash(env.LAIS_PARCEL_LAYER_URL || `${base}/FeatureServer/17`);
   const layerMatch = /^(https?:\/\/.+)\/FeatureServer\/\d+$/i.exec(plotLayerUrl);

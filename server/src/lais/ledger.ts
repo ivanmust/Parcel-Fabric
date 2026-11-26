@@ -32,6 +32,10 @@ export interface LedgerEntry {
   reported?: Record<string, unknown>;
   /** The "editing done" notification to LAIS, once a GIS editor has finished the work. */
   editingDone?: EditingDone;
+  /** The registrar's approval (LAIS → GIS): UPIs assigned in the version, then reconciled and posted. */
+  approval?: Approval;
+  /** The registrar's rejections, oldest first; each names the editing-done event it rejected. */
+  rejections?: Rejection[];
   createdAt: string;
   /** Last change of the entry, including of what LAIS sees (stage, result parcels, warnings). */
   updatedAt: string;
@@ -62,6 +66,31 @@ export interface EditingDone {
   /** LAIS's explanation, when it gave one. */
   lastMessage: string | null;
   deliveredAt: string | null;
+}
+
+/**
+ * The approval of an editing-done event. `approving` while GIS assigns the UPIs and posts (or after an
+ * attempt that failed: a retry reuses the same UPIs); `approved` once the version is in sde.DEFAULT.
+ */
+export interface Approval {
+  eventId: string;
+  status: "approving" | "approved";
+  approvedBy: string;
+  requestedAt: string;
+  approvedAt: string | null;
+  /** The cell (UPI prefix) the new UPIs are numbered in. */
+  cell: string | null;
+  /** The UPI of every resulting parcel, by its Plot global id (parcel_ref in the notification). */
+  upis: Array<{ parcel_ref: string; UPI: string; assigned: boolean }>;
+  attempts: number;
+  lastError: string | null;
+}
+
+export interface Rejection {
+  eventId: string;
+  rejectedBy: string;
+  reason: string;
+  at: string;
 }
 
 export interface Completion {

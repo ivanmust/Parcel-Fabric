@@ -330,6 +330,8 @@ export interface LayerSchema {
   optional: Partial<Record<Optional, string[]>>;
   /** Editor tracking: when the Plot was last edited. */
   editDateField?: string;
+  /** Every Plot field's ArcGIS type by name (e.g. esriFieldTypeDate), for faithful attribute export. */
+  fieldTypes: Record<string, string>;
   /** The Parcel Fabric Records layer (related to Plot through createdbyrecord); null if not published. */
   records: RecordsSchema | null;
 }
@@ -398,6 +400,7 @@ export async function layerSchema(token: string): Promise<LayerSchema> {
     lengths,
     optional,
     editDateField: typeof editDate === "string" && byLower.has(editDate.toLowerCase()) ? byLower.get(editDate.toLowerCase())!.name : undefined,
+    fieldTypes: Object.fromEntries(((meta.fields ?? []) as Array<{ name: string; type?: string }>).map((x) => [x.name, String(x.type ?? "")])),
     records: await recordsSchema(token, meta),
   };
   schemaCache = { value, at: Date.now() };
@@ -586,7 +589,7 @@ async function createVersion(token: string, shortName: string, description: stri
  */
 const PERMANENT_REFUSAL = /user type extension|not been assigned|not licensed|license|permission|not authorized|insufficient privilege|does not have (the )?(required )?privilege/i;
 
-function asConfigurationError(error: unknown): unknown {
+export function asConfigurationError(error: unknown): unknown {
   if (error instanceof ArcGisError && (error.code === 403 || PERMANENT_REFUSAL.test(error.message))) {
     return new LaisConfigurationError(`The LAIS ArcGIS account cannot edit: ${error.message}`);
   }

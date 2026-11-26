@@ -42,6 +42,8 @@ tags:
     description: Saved map views per user
   - name: LAIS
     description: LAIS transaction intake (server-to-server, X-API-Key)
+  - name: Webhooks
+    description: Subdivision completion webhook to App B (administrators); contract in docs/SUBDIVISION-WEBHOOK.md
   - name: LAIS editing
     description: GIS editors send a LAIS transaction's finished work to LAIS for the registrar's approval (switch LAIS_EDITING_DONE)
   - name: Diagnostics
@@ -374,6 +376,114 @@ paths:
         "502": { $ref: "#/components/responses/LaisFailure" }
         "503": { $ref: "#/components/responses/LaisFailure" }
 
+  /lais/transactions/{transactionId}/approve:
+    post:
+      tags: [LAIS]
+      operationId: approveLaisTransaction
+      summary: The registrar approved the work GIS sent; GIS assigns the new UPIs and posts it
+      description: |
+        Approves one editing-done notification (`event_id`). GIS gives every new parcel its UPI in the transaction's
+        version (the next numbers of the parents' cell; retired UPIs are never reused), then reconciles and posts the
+        version to sde.DEFAULT. `data` is the transaction as `GET /transactions/{id}` reports it (stage `Posted`, result
+        parcels) plus `approval.upis`: the UPI of each new parcel by `parcel_ref` (from the notification).
+
+        Only when the approval flow is switched on in GIS (`FLOW_NOT_ENABLED` otherwise).
+
+        Safe to repeat after a failure: a retry reuses the same UPIs. Once approved, a repeat is `409 ALREADY_APPROVED`
+        with the UPIs in `data`. Errors (409): `NOT_SUBMITTED`, `EVENT_MISMATCH` (decide on `data.latest_event_id`),
+        `ALREADY_REJECTED`, `CHANGED_SINCE_SUBMISSION` (the editor changed the work; a new notification follows),
+        `NOT_READY`, `VERSION_GONE`, `ALREADY_POSTED`, `RECONCILE_CONFLICT` (the editor must resolve it and send again),
+        `VERSION_IN_USE` (retry later), `CELL_REQUIRED` (the parents are in several cells: send `cell`). Nothing is
+        posted on any of them. `503 GIS_NOT_CONFIGURED`: the GIS account cannot edit (licence).
+      security:
+        - laisApiKey: []
+      parameters:
+        - name: transactionId
+          in: path
+          required: true
+          schema: { type: string, minLength: 1 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [event_id, approved_by]
+              properties:
+                event_id: { type: string, format: uuid, description: "The editing-done notification being approved." }
+                approved_by: { type: string, maxLength: 100, example: "registrar.one" }
+                cell: { type: string, pattern: '^\d/\d{2}/\d{2}/\d{2}$', example: "1/02/13/02", description: "Only when GIS asks for it (CELL_REQUIRED)." }
+      responses:
+        "200":
+          description: Approved and posted
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LaisSuccess" }
+              example:
+                success: true
+                case: "Yes"
+                message: "Approved: GIS posted the change with 2 parcel(s)."
+                data:
+                  Transaction_ID: LAIS-SUB-2026-00125
+                  stage: Posted
+                  approval:
+                    event_id: 7d1f0c2e-5b7a-4c1e-9a55-2f3d8e6b1c90
+                    status: approved
+                    approved_by: registrar.one
+                    approved_at: "2026-11-27T10:02:11.000Z"
+                    cell: 1/02/13/02
+                    upis:
+                      - { parcel_ref: "{B48C7050-494C-4538-B8E7-569376E8D956}", UPI: 1/02/13/02/9010 }
+                      - { parcel_ref: "{98E9F2FA-E697-4F0B-8973-2B4DA555E63F}", UPI: 1/02/13/02/9011 }
+        "401": { $ref: "#/components/responses/LaisFailure" }
+        "404": { $ref: "#/components/responses/LaisFailure" }
+        "409": { $ref: "#/components/responses/LaisFailure" }
+        "422": { $ref: "#/components/responses/LaisFailure" }
+        "429": { $ref: "#/components/responses/LaisFailure" }
+        "502": { $ref: "#/components/responses/LaisFailure" }
+        "503": { $ref: "#/components/responses/LaisFailure" }
+
+  /lais/transactions/{transactionId}/reject:
+    post:
+      tags: [LAIS]
+      operationId: rejectLaisTransaction
+      summary: The registrar rejected the work GIS sent; the editor revises it and sends it again
+      description: |
+        Records the rejection of one editing-done notification with the reason, shown to the GIS editor. Nothing in GIS
+        changes. The editor revises the work in the same version and sends a new notification (new `event_id`).
+        Errors (409): `NOT_SUBMITTED`, `EVENT_MISMATCH`, `ALREADY_REJECTED`, `ALREADY_APPROVED`, `APPROVAL_IN_PROGRESS`.
+      security:
+        - laisApiKey: []
+      parameters:
+        - name: transactionId
+          in: path
+          required: true
+          schema: { type: string, minLength: 1 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [event_id, rejected_by, reason]
+              properties:
+                event_id: { type: string, format: uuid }
+                rejected_by: { type: string, maxLength: 100, example: "registrar.one" }
+                reason: { type: string, maxLength: 1000, example: "The new boundary does not follow the survey plan." }
+      responses:
+        "200":
+          description: Rejection recorded
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LaisSuccess" }
+        "401": { $ref: "#/components/responses/LaisFailure" }
+        "404": { $ref: "#/components/responses/LaisFailure" }
+        "409": { $ref: "#/components/responses/LaisFailure" }
+        "422": { $ref: "#/components/responses/LaisFailure" }
+        "429": { $ref: "#/components/responses/LaisFailure" }
+
   /client-log:
     post:
       tags: [Diagnostics]
@@ -494,6 +604,40 @@ paths:
         "202": { description: Not delivered yet (retrying) or refused by LAIS }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
+
+  /webhooks/subdivision/events:
+    get:
+      tags: [Webhooks]
+      operationId: listSubdivisionWebhookEvents
+      summary: Subdivision completion events in the outbox (newest first)
+      description: Requires admin:audit. Shows payloads, delivery state and attempt history; never signing keys.
+      parameters:
+        - { name: status, in: query, required: false, schema: { type: string, enum: [pending, delivering, delivered, dead] } }
+      responses:
+        "200": { description: "enabled, events" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /webhooks/subdivision/waiting:
+    get:
+      tags: [Webhooks]
+      operationId: listSubdivisionWebhookWaiting
+      summary: Posted subdivisions whose event waits for complete data (e.g. a missing UPI)
+      responses:
+        "200": { description: "waiting: key, since, lastCheckedAt, checks, reason" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /webhooks/subdivision/events/{eventId}/replay:
+    post:
+      tags: [Webhooks]
+      operationId: replaySubdivisionWebhookEvent
+      summary: Queue a dead-lettered event again (after fixing the cause)
+      parameters:
+        - { name: eventId, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: The event, pending again }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { description: The event is not dead-lettered }
 
 security:
   - bearerAuth: []

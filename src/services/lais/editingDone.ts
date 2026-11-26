@@ -26,6 +26,18 @@ export interface LaisTransactionSummary {
   version_name: string;
   posted: boolean;
   editing_done: EditingDoneView | null;
+  /** The registrar's decision on the work last sent (LAIS → GIS). */
+  decision: LaisDecision | null;
+}
+
+export interface LaisDecision {
+  /** approving: approved, GIS is posting (or the last attempt failed: see error; LAIS retries). */
+  kind: "approved" | "approving" | "rejected";
+  by: string;
+  at: string | null;
+  upis: string[];
+  reason: string | null;
+  error: string | null;
 }
 
 export interface ParcelInfo {
@@ -65,8 +77,13 @@ export const sendEditingDone = (transactionId: string, recordName?: string) =>
     json: recordName ? { recordName } : {},
   });
 
-/** How a notification's state reads to an editor. */
-export function describeStatus(d: EditingDoneView | null): { label: string; tone: "ok" | "wait" | "bad" | "none" } {
+/** How a notification's state, and the registrar's decision on it, read to an editor. */
+export function describeStatus(d: EditingDoneView | null, decision: LaisDecision | null = null): { label: string; tone: "ok" | "wait" | "bad" | "none" } {
+  if (decision?.kind === "approved") return { label: `Approved by ${decision.by} · posted${decision.upis.length ? ` (${decision.upis.join(", ")})` : ""}`, tone: "ok" };
+  if (decision?.kind === "approving") {
+    return decision.error ? { label: `Approved, but GIS could not post it yet: ${decision.error}`, tone: "bad" } : { label: "Approved · GIS is posting", tone: "wait" };
+  }
+  if (decision?.kind === "rejected") return { label: `Rejected by ${decision.by}: ${decision.reason ?? ""} · revise and send again`, tone: "bad" };
   if (!d) return { label: "Not sent to LAIS", tone: "none" };
   switch (d.status) {
     case "delivered":
