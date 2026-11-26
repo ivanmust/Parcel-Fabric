@@ -172,6 +172,35 @@ async function clearInheritedUpi(objectIds: number[]): Promise<void> {
   if (failed?.error) throw new Error(`The old UPI could not be cleared from the new parcels: ${failed.error.message}`);
 }
 
+/**
+ * The location (province … village) the new parcels should carry: each field on which all the parents
+ * agree. Read before the operation, while the parents are current. Divide and merge do not copy these
+ * fields, and the new parcels need them (LAIS's "editing done" notification, the e-title) before any
+ * UPI is assigned.
+ */
+async function parentLocation(parentIds: number[]): Promise<Record<string, unknown>> {
+  const info = parcelLayer();
+  const fields = LOCATION_FIELDS.filter((f) => hasField(info.layer, f));
+  if (!fields.length || !parentIds.length) return {};
+  const rows = await sessionRows(info, { objectIds: parentIds, outFields: fields });
+  const agreed: Record<string, unknown> = {};
+  for (const f of fields) {
+    const values = new Set(rows.map((r) => r[f]).filter((v) => v !== null && v !== undefined && v !== ""));
+    if (values.size === 1) agreed[f] = [...values][0];
+  }
+  return agreed;
+}
+
+/** Give the new parcels their parents' location (see parentLocation). */
+async function inheritLocation(objectIds: number[], location: Record<string, unknown>): Promise<void> {
+  if (!objectIds.length || !Object.keys(location).length) return;
+  const info = parcelLayer();
+  const oid = info.layer.objectIdField;
+  const res = await info.layer.applyEdits({ updateFeatures: objectIds.map((id) => ({ attributes: { [oid]: id, ...location } })) as never });
+  const failed = res.updateFeatureResults.find((r) => r.error);
+  if (failed?.error) throw new Error(`The location could not be copied to the new parcels: ${failed.error.message}`);
+}
+
 /** Current parcels' shapes (data coordinate system, metres) with their UPIs, for the neighbour check. */
 async function mergeCandidates(objectIds: number[]) {
   const info = parcelLayer();
@@ -260,6 +289,7 @@ export const parcelFabricService = {
     const notNeighbours = await this.checkMergeNeighbours(objectIds);
     if (notNeighbours) throw new Error(notNeighbours);
     const recordType = await checkRecordType("Merge");
+    const location = await parentLocation(objectIds);
     const result = await callServer(`${serviceUrls().fabric}/merge`, {
       parentParcels: JSON.stringify(parents.map((p) => ({ id: p.globalId, layerId: String(info.serviceLayerId) }))),
       record: record.globalId,
@@ -269,6 +299,7 @@ export const parcelFabricService = {
     });
     versionSession.recordServerOperation("Merge parcels", result, { record: record.name, parents: parents.map((p) => p.name), newName: name });
     try {
+      await inheritLocation(addedObjectIds(result, info), location);
       await stampRecordType(recordType, "Merge");
     } catch (e) {
       throw new Error(`The parcels were merged, but the history is incomplete: ${(e as Error).message} Use Discard to roll it back.`, { cause: e });
@@ -289,6 +320,7 @@ export const parcelFabricService = {
     const [parcel] = await readParcels([objectId]);
     if (!parcel) throw new Error("The selected parcel is historic or no longer exists.");
     const recordType = await checkRecordType("Subdivision");
+    const location = await parentLocation([objectId]);
     const result = await callServer(`${serviceUrls().fabric}/divide`, {
       divideParcelGuid: parcel.globalId,
       divideParcelType: String(info.serviceLayerId),
@@ -306,6 +338,7 @@ export const parcelFabricService = {
     const created = addedObjectIds(result, info);
     try {
       await clearInheritedUpi(created);
+      await inheritLocation(created, location);
       await stampRecordType(recordType, "Subdivision");
     } catch (e) {
       throw new Error(`The parcel was divided, but the history is incomplete: ${(e as Error).message} Use Discard to roll it back.`, { cause: e });

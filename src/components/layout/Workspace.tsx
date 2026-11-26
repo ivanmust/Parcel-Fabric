@@ -12,6 +12,7 @@ import { GoToCoordinatesDialog } from "../dialogs/GoToCoordinatesDialog";
 import { ShortcutsDialog } from "../dialogs/ShortcutsDialog";
 import { SettingsDialog } from "../dialogs/SettingsDialog";
 import { ProfileDialog } from "../dialogs/ProfileDialog";
+import { AuditDialog } from "../dialogs/AuditDialog";
 import { VersionManagerDialog } from "../dialogs/VersionManagerDialog";
 import { SelectByAttributesDialog } from "../dialogs/SelectByAttributesDialog";
 import { SelectByLocationDialog } from "../dialogs/SelectByLocationDialog";
@@ -27,6 +28,7 @@ export function Workspace() {
   useEffect(() => installClientErrorReporting(), []);
   const leftOpen = useApp((s) => s.leftOpen);
   const rightOpen = useApp((s) => s.rightOpen);
+  const canAudit = useApp((s) => !!s.user?.permissions.includes("admin:audit"));
 
   return (
     <div className="ps-app">
@@ -46,6 +48,7 @@ export function Workspace() {
       <ShortcutsDialog />
       <SettingsDialog />
       <ProfileDialog />
+      {canAudit && <AuditDialog />}
       <VersionManagerDialog />
       <SelectByAttributesDialog />
       <SelectByLocationDialog />

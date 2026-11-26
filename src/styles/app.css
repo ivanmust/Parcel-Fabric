@@ -1048,3 +1048,118 @@ button.ps-version-chip:focus-visible {
   box-shadow: 0 2px 8px rgb(0 0 0 / 30%);
   font-size: 13px;
 }
+
+/* Activity audit dialog */
+.ps-audit {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.ps-audit-filters {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 0 10px;
+  margin-bottom: 4px;
+}
+
+.ps-audit-filters calcite-label {
+  --calcite-label-margin-bottom: 6px;
+}
+
+.ps-audit-search {
+  grid-column: span 2;
+}
+
+.ps-audit-table {
+  height: calc(100vh - 330px);
+  min-height: 220px;
+  border: 1px solid var(--calcite-color-border-3);
+  border-radius: 4px;
+}
+
+.ps-audit-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--calcite-color-foreground-2);
+  text-align: left;
+  font-weight: 600;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--calcite-color-border-2);
+  white-space: nowrap;
+}
+
+.ps-audit-row {
+  cursor: pointer;
+}
+
+.ps-audit-row:hover,
+.ps-audit-row.open {
+  background: var(--calcite-color-foreground-2);
+}
+
+.ps-audit-more td {
+  background: var(--calcite-color-foreground-1);
+  padding: 8px 14px 12px;
+}
+
+.ps-audit-more .kv {
+  grid-template-columns: 120px 1fr;
+  max-width: 640px;
+  font-size: 12px;
+}
+
+.ps-audit-table td.target {
+  max-width: 300px;
+  overflow-wrap: anywhere;
+}
+
+.ps-audit-table td.activity,
+.ps-audit-table td.result {
+  white-space: nowrap;
+  width: 1%;
+}
+
+.ps-audit-json {
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  max-height: 260px;
+  overflow: auto;
+  font-size: 11px;
+  background: var(--calcite-color-foreground-2);
+  border-radius: 4px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* Editing done (send a LAIS transaction's work for approval) */
+.ps-editing-done {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.ps-editing-done-list {
+  margin: 4px 0 0;
+  padding-left: 18px;
+}
+
+.ps-editing-done-table {
+  max-height: 200px;
+  border: 1px solid var(--calcite-color-border-3);
+  border-radius: 4px;
+}
+
+.ps-editing-done-table th {
+  text-align: left;
+  font-weight: 600;
+  padding: 4px 10px;
+  background: var(--calcite-color-foreground-2);
+  border-bottom: 1px solid var(--calcite-color-border-2);
+}
+
+.ps-editing-done-diff {
+  color: var(--calcite-color-status-danger);
+  font-weight: 600;
+}

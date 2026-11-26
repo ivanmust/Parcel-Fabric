@@ -80,7 +80,7 @@ interface AppState extends Prefs {
   notices: Notice[];
   toasts: Notice[];
   logs: LogEntry[];
-  dialogs: { goTo: boolean; shortcuts: boolean; settings: boolean; profile: boolean };
+  dialogs: { goTo: boolean; shortcuts: boolean; settings: boolean; profile: boolean; audit: boolean };
 
   setConfig(c: AppRuntimeConfig): void;
   setUser(u: SessionUser | null): void;
@@ -127,7 +127,7 @@ export const useApp = create<AppState>((set, get) => ({
   notices: [],
   toasts: [],
   logs: [],
-  dialogs: { goTo: false, shortcuts: false, settings: false, profile: false },
+  dialogs: { goTo: false, shortcuts: false, settings: false, profile: false, audit: false },
 
   setConfig: (config) => set({ config }),
   setUser: (user) => set({ user }),

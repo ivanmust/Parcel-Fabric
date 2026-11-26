@@ -18,6 +18,8 @@ const PLOT = `${SERVER}/rest/services/ParcelFabric/FeatureServer/17`;
 const VMS = `${SERVER}/rest/services/ParcelFabric/VersionManagementServer`;
 const RECORDS = `${SERVER}/rest/services/ParcelFabric/FeatureServer/2`;
 const REFERER = "https://gis-api.test";
+const WEBHOOK = "https://lais-webhook.test/editing-done";
+const WEBHOOK_KEY = "key-issued-by-lais-0123456789";
 const OWNER = "svc_lais";
 const auditDir = mkdtempSync(path.join(tmpdir(), "lais-audit-"));
 
@@ -55,7 +57,12 @@ const FIELDS = [
   { name: "createdbyrecord" },
   { name: "size" },
   { name: "Shape__Area" },
+  { name: "province" },
   { name: "district" },
+  { name: "sector" },
+  { name: "cell" },
+  { name: "village" },
+  { name: "globalid" },
   { name: "last_edited_date" },
 ];
 const RECORD_FIELDS = [{ name: "objectid" }, { name: "name" }, { name: "recordeddate" }, { name: "globalid" }, { name: "transaction_id" }];
@@ -65,6 +72,10 @@ const fake = {
   plots: new Map<number, Attrs>(),
   /** Parcel Fabric records in DEFAULT (a record reaches DEFAULT when its version is posted). */
   records: [] as Attrs[],
+  /** Records created inside a version (by full version name), not yet posted. */
+  versionRecords: new Map<string, Attrs[]>(),
+  /** What the LAIS "editing done" endpoint received, and the answers it gives (then 200). */
+  webhook: { calls: [] as Array<{ headers: Headers; body: Record<string, any> }>, answers: [] as Array<{ status: number; body?: unknown } | "timeout"> },
   versions: [] as FakeVersion[],
   branchVersioned: true,
   failNextApplyEdits: false,
@@ -88,6 +99,8 @@ const fake = {
       [10, { objectid: 10, name: "1/02/13/02/1010" }],
     ]);
     this.records = [];
+    this.versionRecords = new Map();
+    this.webhook = { calls: [], answers: [] };
     this.versions = [];
     this.branchVersioned = true;
     this.failNextApplyEdits = false;
@@ -161,11 +174,22 @@ function conjunction(clause: string): (a: Attrs) => boolean {
 const realFetch = globalThis.fetch;
 globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
   const url = String(input instanceof Request ? input.url : input);
+  if (url === WEBHOOK) {
+    fake.webhook.calls.push({ headers: new Headers(init?.headers), body: JSON.parse(String(init?.body)) });
+    const answer = fake.webhook.answers.shift() ?? { status: 200, body: { received: true } };
+    if (answer === "timeout") throw Object.assign(new Error("The operation was aborted due to timeout"), { name: "TimeoutError" });
+    return json(answer.body ?? {}, answer.status);
+  }
   if (!url.startsWith("https://fake-gis.test")) return realFetch(input, init);
   const params = Object.fromEntries(new URLSearchParams(String(init?.body ?? "")));
   const headers = new Headers(init?.headers);
   fake.calls.push({ url, params, referer: headers.get("referer") });
 
+  if (url === `${PORTAL}/sharing/rest/community/self`) {
+    // Web-app users: "editor-*" tokens can edit features; anything else is a viewer.
+    const editor = params.token?.startsWith("editor-");
+    return json({ username: editor ? "editor.one" : "viewer.one", fullName: "Test User", role: "org_user", privileges: editor ? ["features:user:edit"] : [] });
+  }
   if (url === `${PORTAL}/sharing/rest/generateToken`) {
     return json({ token: `tok-${++fake.tokenSerial}`, expires: Date.now() + 30 * 60_000 });
   }
@@ -175,13 +199,16 @@ globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) =>
   }
   if (url === PLOT) {
     return json({
-      name: "Plot", isDataBranchVersioned: fake.branchVersioned, objectIdField: "objectid", fields: FIELDS,
+      name: "Plot", isDataBranchVersioned: fake.branchVersioned, objectIdField: "objectid", globalIdField: "globalid", fields: FIELDS,
       editFieldsInfo: { editDateField: "last_edited_date" },
       relationships: [{ keyField: "CreatedByRecord", relatedTableId: 2 }],
     });
   }
   if (url === RECORDS) return json({ name: "Records", objectIdField: "objectid", globalIdField: "globalid", fields: RECORD_FIELDS });
-  if (url === `${RECORDS}/query`) return json({ features: fake.records.filter(where(params.where!)).map((attributes) => ({ attributes })) });
+  if (url === `${RECORDS}/query`) {
+    const visible = [...fake.records, ...(params.gdbVersion ? (fake.versionRecords.get(params.gdbVersion) ?? []) : [])];
+    return json({ features: visible.filter(where(params.where!)).map((attributes) => ({ attributes })) });
+  }
   if (url === `${PLOT}/query`) {
     const match = where(params.where!);
     let rows = [...viewOf(params.gdbVersion).values()].filter(match);
@@ -241,7 +268,13 @@ let clientIp = "10.0.0.1";
 let clientNo = 1;
 const client = () => ({ "X-Forwarded-For": clientIp });
 let resetToken: () => void;
-let cfg: { LAIS_WRITE_MODE: "version-only" | "attributes"; LAIS_API_KEY_PREVIOUS: string };
+let cfg: {
+  LAIS_WRITE_MODE: "version-only" | "attributes";
+  LAIS_API_KEY_PREVIOUS: string;
+  LAIS_EDITING_DONE: "true" | "false";
+  LAIS_WEBHOOK_URL: string;
+  LAIS_WEBHOOK_KEY: string;
+};
 
 before(async () => {
   const { createApp } = await import("../src/app.js");
@@ -263,6 +296,9 @@ beforeEach(async () => {
   resetToken();
   cfg.LAIS_WRITE_MODE = "attributes";
   cfg.LAIS_API_KEY_PREVIOUS = "";
+  cfg.LAIS_EDITING_DONE = "false";
+  cfg.LAIS_WEBHOOK_URL = WEBHOOK;
+  cfg.LAIS_WEBHOOK_KEY = WEBHOOK_KEY;
   clientIp = `10.0.${Math.floor(++clientNo / 250)}.${clientNo % 250}`;
 });
 
@@ -913,6 +949,218 @@ describe("completion: LAIS sees when GIS has posted the change, and the resultin
     const l = await get("/transactions?updatedSince=yesterday&stage=Done&limit=0&page=2");
     assert.equal(l.status, 400);
     assert.deepEqual(l.body.errors.map((e: any) => `${e.field}:${e.code}`).sort(), ["limit:INVALID_LIMIT", "page:UNKNOWN_FIELD", "stage:INVALID_STAGE", "updatedSince:INVALID_DATE"]);
+  });
+});
+
+describe("editing done: GIS tells LAIS the work is ready for the registrar", () => {
+  let deliverDue: (now?: number) => Promise<void>;
+  const VERSION = "svc_lais.SUBV-LAIS-SUB-2026-00125-20261124";
+  const RECORD = "SUBV-LAIS-SUB-2026-00125-20261124";
+  const PLACE = { province: "Kigali City", district: "Gasabo", sector: "Remera", cell: "Nyarutarama", village: "Kamahwa" };
+  const editingBase = () => base.replace(/\/lais$/, "/lais-editing");
+  const editing = async (pathAndQuery: string, init: RequestInit & { token?: string } = {}) => {
+    const { token = "editor-token", ...rest } = init;
+    const res = await fetch(`${editingBase()}${pathAndQuery}`, {
+      ...rest,
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", ...client(), ...(rest.headers as Record<string, string>) },
+    });
+    return { status: res.status, body: (await res.json()) as Record<string, any> };
+  };
+  const done = (id = valid.Transaction_ID, body: unknown = {}) => editing(`/transactions/${encodeURIComponent(id)}/editing-done`, { method: "POST", body: JSON.stringify(body) });
+  const laisView = async () => (await (await fetch(`${base}/transactions/${valid.Transaction_ID}`, { headers: { "x-api-key": KEY, ...client() } })).json()) as Record<string, any>;
+  /** The editor's subdivision of plot 1 into 11 + 12, saved in the transaction's version (not posted). */
+  function subdivideInVersion(opts: { recordName?: string; parcels?: number[]; retire?: number } = {}) {
+    const v = fake.versions.find((x) => x.name === VERSION)!;
+    Object.assign(fake.plots.get(1)!, { size: 100, ...PLACE });
+    v.saved.set(opts.retire ?? 1, { retiredbyrecord: "{REC-1}" });
+    for (const id of opts.parcels ?? [11, 12]) v.saved.set(id, { objectid: id, globalid: `{G-${id}}`, name: null, createdbyrecord: "{REC-1}", size: 50, ...PLACE });
+    fake.versionRecords.set(VERSION, [{ globalid: "{REC-1}", name: opts.recordName ?? RECORD }]);
+  }
+  const startOver = async () => {
+    fake.reset();
+    await resetLais();
+    resetToken();
+    cfg.LAIS_WRITE_MODE = "version-only";
+    assert.equal((await submit(valid)).status, 201);
+  };
+
+  before(async () => {
+    ({ deliverDueEditingDone: deliverDue } = await import("../src/lais/editingDone.js"));
+  });
+  beforeEach(async () => {
+    cfg.LAIS_EDITING_DONE = "true";
+    await startOver();
+  });
+
+  test("switched off by default: the web app is told, and nothing can be sent", async () => {
+    cfg.LAIS_EDITING_DONE = "false";
+    subdivideInVersion();
+    const list = await editing("/transactions");
+    assert.equal(list.status, 200);
+    assert.equal(list.body.enabled, false);
+    const r = await done();
+    assert.equal(r.status, 503);
+    assert.equal(r.body.error.code, "feature_disabled");
+    assert.equal(fake.webhook.calls.length, 0);
+    const config = (await (await fetch(base.replace(/\/lais$/, "/config"))).json()) as Record<string, any>;
+    assert.deepEqual(config.features, { laisEditingDone: false });
+  });
+
+  test("only signed-in editors: no token 401, a viewer 403", async () => {
+    assert.equal((await fetch(`${editingBase()}/transactions`, { headers: client() })).status, 401);
+    assert.equal((await editing("/transactions", { token: "viewer-token" })).status, 403);
+  });
+
+  test("preview: the agreed format, built from the version, and nothing sent", async () => {
+    subdivideInVersion();
+    const r = await editing(`/transactions/${valid.Transaction_ID}/preview`);
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    assert.deepEqual(r.body.problems, []);
+    const p = r.body.payload;
+    assert.deepEqual(Object.keys(p), ["event_type", "Transaction_ID", "Transaction_Type", "version_name", "record_name", "edited_by", "parent_parcels", "proposed_parcels", "totals"]);
+    assert.equal(p.version_name, VERSION);
+    assert.equal(p.record_name, RECORD);
+    assert.equal(p.edited_by, "editor.one");
+    assert.deepEqual(p.parent_parcels, [{ UPI: "1/02/13/02/1001", area_sqm: 100, ...PLACE }]);
+    assert.deepEqual(p.proposed_parcels.map((x: any) => [x.parcel_ref, x.UPI, x.area_sqm]), [["{G-11}", null, 50], ["{G-12}", null, 50]]);
+    assert.deepEqual(Object.keys(p.proposed_parcels[0]), ["parcel_ref", "UPI", "area_sqm", "province", "district", "sector", "cell", "village", "geometry"]);
+    // GeoJSON: outer ring counter-clockwise (ArcGIS gives it clockwise)
+    assert.deepEqual(p.proposed_parcels[0].geometry, { type: "Polygon", coordinates: [[[0, 0], [5, 0], [5, 10], [0, 10], [0, 0]]] });
+    assert.deepEqual(p.totals, { parent_area_sqm: 100, proposed_area_sqm: 100 });
+    assert.equal(fake.webhook.calls.length, 0);
+    const recordReads = fake.calls.filter((c) => c.url === `${RECORDS}/query`);
+    assert.ok(recordReads.length && recordReads.every((c) => c.params.gdbVersion === VERSION), "records are read in the version");
+    assert.ok(gisCalls("/applyEdits").length === 0 && gisCalls("/startEditing").length === 0, "nothing is edited");
+  });
+
+  test("editing done: LAIS receives exactly the agreed message once; LAIS's view of the transaction does not change", async () => {
+    subdivideInVersion();
+    const before = await laisView();
+    const r = await done();
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    assert.equal(r.body.editing_done.status, "delivered");
+    assert.equal(fake.webhook.calls.length, 1);
+    const call = fake.webhook.calls[0]!;
+    assert.equal(call.headers.get("x-api-key"), WEBHOOK_KEY);
+    assert.equal(call.headers.get("x-gis-event-type"), "editing.completed");
+    assert.equal(call.headers.get("x-gis-event-id"), call.body.event_id);
+    assert.deepEqual(Object.keys(call.body), ["event_id", "event_type", "sent_at", "Transaction_ID", "Transaction_Type", "version_name", "record_name", "edited_by", "parent_parcels", "proposed_parcels", "totals"]);
+    assert.equal(call.body.event_id, r.body.editing_done.event_id);
+    assert.ok(!Number.isNaN(Date.parse(call.body.sent_at)));
+
+    const again = await done();
+    assert.equal(again.status, 409);
+    assert.equal(again.body.error.code, "already_sent");
+    assert.equal(fake.webhook.calls.length, 1, "never sent twice");
+
+    const list = await editing("/transactions");
+    assert.equal(list.body.transactions[0].editing_done.status, "delivered");
+    assert.equal(list.body.transactions[0].editing_done.parcels, 2);
+    const after = await laisView();
+    assert.equal(after.data.updated_at, before.data.updated_at, "LAIS's polling must not see a change");
+  });
+
+  test("the record named by the editor is used when it is not named after the version", async () => {
+    subdivideInVersion({ recordName: "Remera split 2026-11" });
+    let r = await done();
+    assert.equal(r.status, 422);
+    assert.match(r.body.error.message, /No Parcel Fabric record named "SUBV-LAIS-SUB-2026-00125-20261124"/);
+    r = await done(valid.Transaction_ID, { recordName: "remera SPLIT 2026-11" });
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    assert.equal(fake.webhook.calls[0]!.body.record_name, "Remera split 2026-11");
+  });
+
+  test("work that does not match the transaction is refused with what to fix, and nothing is sent", async () => {
+    let r = await done();
+    assert.equal(r.status, 422, "no record yet");
+    assert.equal(r.body.error.code, "not_ready");
+    assert.ok(r.body.error.details.problems.length);
+
+    subdivideInVersion({ parcels: [11] });
+    r = await done();
+    assert.match(r.body.error.message, /at least 2 parcels; the record .* has 1/);
+
+    await startOver();
+    subdivideInVersion({ retire: 4 });
+    r = await done();
+    assert.equal(r.status, 422);
+    assert.match(r.body.error.message, /1\/02\/13\/02\/1001 is not replaced by the record/);
+    assert.equal(fake.webhook.calls.length, 0);
+  });
+
+  test("LAIS down: retried with the same event_id on schedule, then delivered", async () => {
+    subdivideInVersion();
+    fake.webhook.answers.push({ status: 503, body: { message: "maintenance" } });
+    const t0 = Date.now();
+    const r = await done();
+    assert.equal(r.status, 202);
+    assert.equal(r.body.editing_done.status, "retrying");
+    assert.equal(r.body.editing_done.last_result, "HTTP 503");
+    assert.ok(Math.abs(Date.parse(r.body.editing_done.next_attempt_at) - (t0 + 60_000)) < 5_000, "next try after about a minute");
+
+    await deliverDue(t0 + 30_000);
+    assert.equal(fake.webhook.calls.length, 1, "not due yet");
+    await deliverDue(t0 + 61_000);
+    assert.equal(fake.webhook.calls.length, 2);
+    assert.equal(fake.webhook.calls[1]!.body.event_id, fake.webhook.calls[0]!.body.event_id);
+    assert.notEqual(fake.webhook.calls[1]!.body.sent_at, fake.webhook.calls[0]!.body.sent_at);
+    const list = await editing("/transactions");
+    assert.equal(list.body.transactions[0].editing_done.status, "delivered");
+    assert.equal(list.body.transactions[0].editing_done.attempts, 2);
+    assert.equal((await done()).status, 409, "a delivered notification is never resent");
+  });
+
+  test("a timeout counts as not delivered", async () => {
+    subdivideInVersion();
+    fake.webhook.answers.push("timeout");
+    const r = await done();
+    assert.equal(r.body.editing_done.status, "retrying");
+    assert.equal(r.body.editing_done.last_result, "timeout");
+  });
+
+  test("while a notification is waiting for a retry, pressing again does not send a duplicate", async () => {
+    subdivideInVersion();
+    fake.webhook.answers.push({ status: 503 });
+    await done();
+    const again = await done();
+    assert.equal(again.status, 202);
+    assert.equal(again.body.editing_done.status, "retrying");
+    assert.equal(fake.webhook.calls.length, 1);
+  });
+
+  test("LAIS refuses (4xx): the editor sees LAIS's message and can send again, as a new event", async () => {
+    subdivideInVersion();
+    fake.webhook.answers.push({ status: 400, body: { message: "Unknown Transaction_ID" } });
+    const r = await done();
+    assert.equal(r.status, 202);
+    assert.equal(r.body.editing_done.status, "refused");
+    assert.equal(r.body.editing_done.last_message, "Unknown Transaction_ID");
+    await deliverDue(Date.now() + 2 * 60 * 60_000);
+    assert.equal(fake.webhook.calls.length, 1, "a refusal is not retried");
+    const again = await done();
+    assert.equal(again.body.editing_done.status, "delivered");
+    assert.notEqual(fake.webhook.calls[1]!.body.event_id, fake.webhook.calls[0]!.body.event_id);
+  });
+
+  test("gives up after 24 hours without a 2xx", async () => {
+    subdivideInVersion();
+    fake.webhook.answers.push({ status: 503 }, { status: 503 });
+    await done();
+    await deliverDue(Date.now() + 25 * 60 * 60_000);
+    const list = await editing("/transactions");
+    assert.equal(list.body.transactions[0].editing_done.status, "failed");
+  });
+
+  test("unknown transaction 404; LAIS endpoint not configured 503; version removed 409", async () => {
+    subdivideInVersion();
+    assert.equal((await done("NO-SUCH")).status, 404);
+    cfg.LAIS_WEBHOOK_KEY = "";
+    assert.equal((await done()).body.error.code, "not_configured");
+    cfg.LAIS_WEBHOOK_KEY = WEBHOOK_KEY;
+    fake.versions = [];
+    const r = await done();
+    assert.equal(r.status, 409);
+    assert.equal(r.body.error.code, "version_gone");
   });
 });
 

@@ -61,6 +61,29 @@ How the API finds the change, reading sde.DEFAULT only, with no licence needed:
 
 `area_sqm` comes from `size`, or the shape area when `size` is empty. The location fields are empty on parcels the editor creates unless the editor fills them.
 
+## "Editing done": GIS tells LAIS the work is ready for approval (built; switched off)
+
+The approval flow agreed with LAIS on 2026-11-26:
+1. LAIS submits the transaction; GIS creates its version (above).
+2. The GIS editor does the work in the version, saves it, and presses **Editing done** (Version Manager ▸ LAIS transactions). GIS sends the proposed parcels to an endpoint LAIS hosts. **Built.**
+3. The registrar approves in LAIS, which calls a GIS approve endpoint: GIS reconciles and posts the version and creates the new UPIs. **Not built yet:** the API's ArcGIS account needs the Advanced Editing licence to post and assign UPIs.
+4. The approve response returns the new UPIs, keyed by `parcel_ref`.
+
+**Switch:** `LAIS_EDITING_DONE=false` by default. Keep it off until steps 2 and 3 both work end to end. With it on, Reconcile & post is not offered for LAIS versions (they are posted at approval), and the editors' Assign UPIs step moves to approval.
+
+**Settings:** `LAIS_WEBHOOK_URL` (LAIS's endpoint) and `LAIS_WEBHOOK_KEY` (the key LAIS issued to GIS, sent as `X-API-Key`), `LAIS_WEBHOOK_TIMEOUT_MS` (default 10 s). For local testing, `npm run mock-lais` in `server/` starts a stand-in LAIS endpoint on port 4010 (`MOCK_LAIS_MODE=ok|fail-once|refuse|slow`); it writes what it receives to `server/data/mock-lais/received.jsonl`.
+
+**What GIS sends** (`POST`, JSON, headers `X-API-Key`, `X-GIS-Event-Id`, `X-GIS-Event-Type: editing.completed`), exactly the sample sent to LAIS:
+`event_id`, `event_type`, `sent_at`, `Transaction_ID`, `Transaction_Type`, `version_name`, `record_name`, `edited_by`, `parent_parcels[]` (`UPI`, `area_sqm`, `province` … `village`), `proposed_parcels[]` (`parcel_ref` = the Plot's global id, `UPI` null for new parcels, `area_sqm`, location, `geometry` as GeoJSON in EPSG:4326), `totals`.
+
+**Where the data comes from:** the transaction's version, read with the LAIS service account (nothing is edited). The record is the one named after the version (or the editor's active record). Proposed parcels = created by the record and current; parents = retired by the record. For a CorrectBoundaries, the transaction's parcels in the version (proposed) and in DEFAULT (parents). Area = `size`, else the shape area. The editor gets clear refusals when the work does not match the transaction: no record, no parcels, a subdivision into fewer than 2 parcels, a merge into more than 1, or the wrong parcel replaced.
+
+**Delivery:** any 2xx = delivered. 408, 429, 5xx, timeout or no connection = retried with the same `event_id` after about 1, 5 and 15 minutes, then hourly, for 24 hours (status `retrying`, then `failed`). Other 4xx = `refused`, with LAIS's message shown to the editor. Refused or failed notifications can be sent again (a new `event_id`); a delivered one is never resent. The state is kept in the ledger entry (`editingDone`), so retries survive a restart; it does not change the `updated_at` LAIS sees. Every attempt is in the audit log (`lais.editing-done`, `lais.editing-done.delivery`).
+
+**Location on new parcels:** Divide and Merge do not copy province … village to the new parcels, and Assign UPIs (which used to fill them) moves to approval. The web app now copies the parents' location onto the new parcels right after a Divide or Merge, for each field on which all parents agree.
+
+Code: [server/src/lais/editingDone.ts](../server/src/lais/editingDone.ts), [server/src/routes/laisEditing.ts](../server/src/routes/laisEditing.ts) (`/api/lais-editing`, signed-in editors), [src/components/dialogs/EditingDoneDialog.tsx](../src/components/dialogs/EditingDoneDialog.tsx).
+
 ## Plot layer fields written (inside the version, `attributes` mode only)
 
 | Field | Value |

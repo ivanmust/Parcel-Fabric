@@ -42,6 +42,7 @@ api.get("/config", (_req, res) => {
     oauthAppId: config.ARCGIS_OAUTH_APP_ID || null,
     services: config.services,
     project: { name: "Kigali Parcel Fabric", dataset: "kigaliParcels" },
+    features: { laisEditingDone: config.LAIS_EDITING_DONE === "true" },
   });
 });
 
@@ -92,13 +93,19 @@ api.post("/audit", requireAuth, async (req, res) => {
 api.get("/audit", requireAuth, requirePermission("admin:audit"), async (req, res) => {
   const q = z
     .object({
-      username: z.string().max(200).optional(),
-      action: z.string().max(120).optional(),
+      username: z.string().trim().max(200).optional(),
+      action: z.string().trim().max(120).optional(),
+      outcome: z.enum(["success", "failure", "attempt"]).optional(),
+      from: z.iso.datetime({ offset: true }).optional(),
+      to: z.iso.datetime({ offset: true }).optional(),
+      q: z.string().trim().max(200).optional(),
+      before: z.string().trim().max(64).optional(),
       limit: z.coerce.number().int().min(1).max(1000).default(200),
     })
+    .strict()
     .safeParse(req.query);
   if (!q.success) throw new HttpError(400, "Invalid query", "invalid_query", q.error.issues);
-  res.json({ events: await readAudit(q.data) });
+  res.json(await readAudit(q.data));
 });
 
 /** Client-side error reports, so production issues reach the server log. */

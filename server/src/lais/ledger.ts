@@ -30,9 +30,38 @@ export interface LedgerEntry {
   completion?: Completion;
   /** What LAIS was last told (without updated_at). `updatedAt` moves only when this changes. */
   reported?: Record<string, unknown>;
+  /** The "editing done" notification to LAIS, once a GIS editor has finished the work. */
+  editingDone?: EditingDone;
   createdAt: string;
   /** Last change of the entry, including of what LAIS sees (stage, result parcels, warnings). */
   updatedAt: string;
+}
+
+/**
+ * The GIS → LAIS "editing done" notification. Kept here (not only in memory) so a notification that
+ * LAIS has not received yet is retried after a restart, always with the same event_id.
+ *   sending   accepted from the editor, first attempt not finished
+ *   retrying  LAIS did not answer or answered 408/429/5xx; next attempt at nextAttemptAt
+ *   delivered LAIS answered 2xx
+ *   refused   LAIS answered another 4xx (the editor sees LAIS's message and can send again)
+ *   failed    no 2xx within 24 hours of the first attempt (the editor can send again)
+ */
+export interface EditingDone {
+  eventId: string;
+  status: "sending" | "retrying" | "delivered" | "refused" | "failed";
+  /** The notification body without sent_at (set on each attempt). */
+  payload: Record<string, unknown>;
+  requestedBy: string;
+  requestedAt: string;
+  attempts: number;
+  firstAttemptAt: string | null;
+  lastAttemptAt: string | null;
+  nextAttemptAt: string | null;
+  /** e.g. "HTTP 503", "timeout", "no connection". */
+  lastResult: string | null;
+  /** LAIS's explanation, when it gave one. */
+  lastMessage: string | null;
+  deliveredAt: string | null;
 }
 
 export interface Completion {

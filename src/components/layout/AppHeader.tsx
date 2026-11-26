@@ -16,6 +16,7 @@ export function AppHeader() {
   const theme = useApp((s) => s.theme);
   const notices = useApp((s) => s.notices);
   const unread = notices.filter((n) => !n.read).length;
+  const canAudit = !!user?.permissions.includes("admin:audit");
   const { setPref, setDialog, markNoticesRead, clearNotices } = useApp.getState();
 
   return (
@@ -81,6 +82,7 @@ export function AppHeader() {
         </div>
       </calcite-popover>
 
+      {canAudit && <calcite-action text="Activity audit" icon="clock" onClick={() => setDialog("audit", true)} />}
       <calcite-action text="Keyboard shortcuts & help" icon="question" onClick={() => setDialog("shortcuts", true)} />
       <calcite-action text="Settings" icon="gear" onClick={() => setDialog("settings", true)} />
       <calcite-action
@@ -110,6 +112,11 @@ export function AppHeader() {
                 <calcite-list-item label="Profile & permissions" onClick={() => setDialog("profile", true)}>
                   <calcite-icon slot="content-start" icon="user" scale="s" />
                 </calcite-list-item>
+                {canAudit && (
+                  <calcite-list-item label="Activity audit" onClick={() => setDialog("audit", true)}>
+                    <calcite-icon slot="content-start" icon="clock" scale="s" />
+                  </calcite-list-item>
+                )}
                 <calcite-list-item label="Sign out" onClick={() => void signOut()}>
                   <calcite-icon slot="content-start" icon="sign-out" scale="s" />
                 </calcite-list-item>

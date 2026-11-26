@@ -58,33 +58,70 @@ export async function writeAudit(event: Omit<AuditEvent, "id" | "time">): Promis
 }
 
 export interface AuditQuery {
+  /** Part of the username, any case. */
   username?: string;
+  /** Start of the action name, e.g. "version." for every version operation. */
   action?: string;
+  outcome?: AuditOutcome;
+  /** Events at or after this time (ISO 8601). */
+  from?: string;
+  /** Events before this time (ISO 8601). */
+  to?: string;
+  /** Text anywhere in the action, user, target or details, any case. */
+  q?: string;
+  /** Paging: the id of the last event already shown; the next page starts after it. */
+  before?: string;
   limit: number;
 }
 
+export interface AuditPage {
+  events: AuditEvent[];
+  /** More events match after the last one returned (pass its id as `before`). */
+  hasMore: boolean;
+}
+
 /** Read the most recent audit events (newest first) across monthly files. */
-export async function readAudit(q: AuditQuery): Promise<AuditEvent[]> {
+export async function readAudit(q: AuditQuery): Promise<AuditPage> {
   let files: string[];
   try {
     files = (await readdir(auditDir)).filter((f) => /^audit-\d{4}-\d{2}\.jsonl$/.test(f)).sort().reverse();
   } catch {
-    return [];
+    return { events: [], hasMore: false };
   }
+  const from = q.from ? Date.parse(q.from) : undefined;
+  const to = q.to ? Date.parse(q.to) : undefined;
+  // Monthly files outside the date range are not read at all.
+  const month = (t: number) => new Date(t).toISOString().slice(0, 7);
+  if (from !== undefined) files = files.filter((f) => f.slice(6, 13) >= month(from));
+  if (to !== undefined) files = files.filter((f) => f.slice(6, 13) <= month(to));
+  const user = q.username?.toLowerCase();
+  const text = q.q?.toLowerCase();
+
   const results: AuditEvent[] = [];
+  let skipping = !!q.before;
   for (const f of files) {
     const lines = (await readFile(path.join(auditDir, f), "utf8")).split("\n").filter(Boolean).reverse();
     for (const line of lines) {
+      let e: AuditEvent;
       try {
-        const e = JSON.parse(line) as AuditEvent;
-        if (q.username && e.username !== q.username) continue;
-        if (q.action && !e.action.startsWith(q.action)) continue;
-        results.push(e);
-        if (results.length >= q.limit) return results;
+        e = JSON.parse(line) as AuditEvent;
       } catch {
-        /* skip corrupt line */
+        continue; // skip corrupt line
       }
+      if (skipping) {
+        if (e.id === q.before) skipping = false;
+        continue;
+      }
+      const time = Date.parse(e.time);
+      if (to !== undefined && time >= to) continue;
+      if (from !== undefined && time < from) return { events: results, hasMore: false }; // newest first: the rest are older
+      if (user && !e.username.toLowerCase().includes(user)) continue;
+      if (q.action && !e.action.startsWith(q.action)) continue;
+      if (q.outcome && e.outcome !== q.outcome) continue;
+      if (text && !`${e.action} ${e.username} ${e.target ?? ""} ${e.details ? JSON.stringify(e.details) : ""}`.toLowerCase().includes(text)) continue;
+      if (results.length === q.limit) return { events: results, hasMore: true };
+      results.push(e);
     }
   }
-  return results;
+  return { events: results, hasMore: false };
 }

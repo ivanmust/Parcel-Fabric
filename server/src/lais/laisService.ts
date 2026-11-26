@@ -277,9 +277,9 @@ export function versionNameFor(input: Pick<LaisSubmission, "Transaction_ID" | "T
 }
 
 /** The short name (after the owner) of a fully qualified version name. */
-const shortVersionName = (full: string) => full.slice(full.lastIndexOf(".") + 1);
+export const shortVersionName = (full: string) => full.slice(full.lastIndexOf(".") + 1);
 
-const sql = (value: string) => `'${value.replace(/'/g, "''")}'`;
+export const sql = (value: string) => `'${value.replace(/'/g, "''")}'`;
 
 // ---------------------------------------------------------------- layer schema
 
@@ -309,9 +309,9 @@ const OPTIONAL_FIELDS = {
   cell: ["cell"],
   village: ["village"],
 } as const;
-type Optional = keyof typeof OPTIONAL_FIELDS;
+export type Optional = keyof typeof OPTIONAL_FIELDS;
 
-interface RecordsSchema {
+export interface RecordsSchema {
   url: string;
   globalIdField: string;
   nameField: string;
@@ -319,8 +319,10 @@ interface RecordsSchema {
   transactionIdField?: string;
 }
 
-interface LayerSchema {
+export interface LayerSchema {
   objectIdField: string;
+  /** The Plot's global id: a parcel's permanent identity, kept through reconcile and post. */
+  globalIdField?: string;
   fields: Record<Logical, string>;
   domains: Partial<Record<Logical, string[]>>;
   /** Text field lengths, where the layer states one. */
@@ -350,7 +352,7 @@ async function recordsSchema(token: string, plotMeta: ArcGisJson): Promise<Recor
 let schemaCache: { value: LayerSchema; at: number } | null = null;
 const SCHEMA_TTL_MS = 10 * 60_000;
 
-async function layerSchema(token: string): Promise<LayerSchema> {
+export async function layerSchema(token: string): Promise<LayerSchema> {
   if (schemaCache && Date.now() - schemaCache.at < SCHEMA_TTL_MS) return schemaCache.value;
   const meta = await arcgisPost(config.lais.plotLayerUrl, {}, token);
   if (meta.isDataBranchVersioned !== true) {
@@ -381,9 +383,16 @@ async function layerSchema(token: string): Promise<LayerSchema> {
     const present = names.map((n) => byLower.get(n)?.name).filter((n): n is string => !!n);
     if (present.length) optional[key] = present;
   }
+  // The shape's area field has a service-specific name (e.g. st_area(shape) on Enterprise geodatabases).
+  const shapeArea = meta.geometryProperties?.shapeAreaFieldName;
+  if (typeof shapeArea === "string" && !(optional.area ?? []).some((n) => n.toLowerCase() === shapeArea.toLowerCase())) {
+    optional.area = [...(optional.area ?? []), shapeArea];
+  }
+  const globalId = typeof meta.globalIdField === "string" && meta.globalIdField ? meta.globalIdField : byLower.get("globalid")?.name;
   const editDate = meta.editFieldsInfo?.editDateField;
   const value: LayerSchema = {
     objectIdField: String(meta.objectIdField ?? "objectid"),
+    globalIdField: globalId,
     fields,
     domains,
     lengths,
@@ -397,13 +406,13 @@ async function layerSchema(token: string): Promise<LayerSchema> {
 
 // ---------------------------------------------------------------- ArcGIS helpers
 
-interface VersionRef {
+export interface VersionRef {
   /** Fully qualified, e.g. owner.LAIS_X_ABCD1234 */
   name: string;
   guid: string;
 }
 
-type Attributes = Record<string, unknown>;
+export type Attributes = Record<string, unknown>;
 
 async function queryPlots(token: string, schema: LayerSchema, where: string, gdbVersion?: string, outFields?: string[], count = 3): Promise<Attributes[]> {
   const body = await arcgisPost(
@@ -420,7 +429,7 @@ async function queryPlots(token: string, schema: LayerSchema, where: string, gdb
   return (body.features ?? []).map((f: { attributes?: Attributes }) => f.attributes ?? {});
 }
 
-const sqlList = (values: string[]) => values.map(sql).join(",");
+export const sqlList = (values: string[]) => values.map(sql).join(",");
 
 /** Plots with their shapes (sde.DEFAULT), and the coordinate system the shapes are in. */
 async function plotShapes(token: string, where: string, outFields: string[]) {
@@ -536,7 +545,7 @@ async function resolveParcels(token: string, schema: LayerSchema, upis: string[]
 }
 
 /** The LAIS account's versions, by lower-case short name. */
-async function ownedVersions(token: string): Promise<Map<string, VersionRef>> {
+export async function ownedVersions(token: string): Promise<Map<string, VersionRef>> {
   const body = await arcgisPost(`${config.lais.versionManagementUrl}/versionInfos`, { ownerFilter: config.LAIS_ARCGIS_USERNAME }, token);
   const owner = config.LAIS_ARCGIS_USERNAME.toLowerCase();
   const versions = new Map<string, VersionRef>();
@@ -719,7 +728,7 @@ const duplicateIdError = (message: string): FieldError[] => [{ field: "Transacti
 const locks = new Map<string, Promise<unknown>>();
 
 /** Serialise work on one Transaction_ID inside this process (concurrent identical retries). */
-async function withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+export async function withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
   const previous = locks.get(key) ?? Promise.resolve();
   const run = previous.catch(() => undefined).then(fn);
   const tail = run.catch(() => undefined);

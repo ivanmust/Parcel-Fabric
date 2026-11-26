@@ -6,6 +6,7 @@ import { versionSession } from "../../gis/version-management/versionSession";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { calciteInput } from "../../utils/calciteInput";
 import { LaisTransactionsDialog } from "./LaisTransactionsDialog";
+import { isLaisVersionName } from "../../gis/version-management/laisVersions";
 
 const fmt = (t?: number) => (t ? new Date(t).toLocaleString("en-GB") : "—");
 
@@ -75,7 +76,9 @@ export function VersionManagerDialog() {
   };
 
   const canManage = hasPermission(user, "versions:manage");
-  const canPost = hasPermission(user, "versions:post");
+  // With "Editing done" on, a LAIS version is posted when the registrar approves in LAIS, not by an editor.
+  const laisApproval = useApp((s) => !!s.config?.features?.laisEditingDone) && isLaisVersionName(current?.name);
+  const canPost = hasPermission(user, "versions:post") && !laisApproval;
   const onCurrent = !!selected && selected.guid === current?.guid;
   const selIsDefault = !!selected && selected.guid === defaultVersion?.guid;
   const owner = (name: string) => (name.includes(".") ? name.slice(0, name.lastIndexOf(".")) : "—");
@@ -259,7 +262,11 @@ export function VersionManagerDialog() {
                     )}
                   </div>
                   {pending > 0 && <div className="muted" style={{ fontSize: 12 }}>Save or discard your {pending} unsaved edit(s) first.</div>}
-                  {!canPost && <div className="muted" style={{ fontSize: 12 }}>Posting to the default version requires the Administrator role.</div>}
+                  {laisApproval ? (
+                    <div className="muted" style={{ fontSize: 12 }}>This is a LAIS transaction version: it is posted when the registrar approves in LAIS. When your work is saved, use LAIS transactions ▸ Editing done.</div>
+                  ) : (
+                    !canPost && <div className="muted" style={{ fontSize: 12 }}>Posting to the default version requires the Administrator role.</div>
+                  )}
                 </div>
               )}
             </>

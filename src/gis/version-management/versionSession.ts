@@ -9,6 +9,7 @@ import { layerRegistry } from "../layers/layerRegistry";
 import { getMapController } from "../map/MapController";
 import { useEditing, isDefaultVersion } from "../../stores/editingStore";
 import { useApp, hasPermission } from "../../stores/appStore";
+import { isLaisVersionName } from "./laisVersions";
 import { arcgisError, describeArcGISError, fetchServiceJson } from "../../services/arcgis/serviceMetadata";
 import { audit } from "../../services/audit/audit";
 import type { Permission } from "../../types/app";
@@ -387,6 +388,9 @@ class VersionSession {
     const current = this.store.current!;
     if (isDefaultVersion(this.store)) throw new Error("The default version cannot be reconciled with itself.");
     if (opts.withPost) this.requirePermission("versions:post", "Your role does not allow posting to the default version.");
+    if (opts.withPost && useApp.getState().config?.features?.laisEditingDone && isLaisVersionName(current.name)) {
+      throw new Error("LAIS transaction versions are posted when the registrar approves in LAIS. Use LAIS transactions ▸ Editing done.");
+    }
     return this.run(opts.withPost ? "Reconciling and posting" : "Reconciling", async () => {
       const startedHere = this.store.session !== "editing";
       if (startedHere) await this.startEditing(true);

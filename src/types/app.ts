@@ -11,6 +11,8 @@ export interface AppRuntimeConfig {
     validationServer: string;
   };
   project: { name: string; dataset: string };
+  /** Server switches (absent on older servers: treat as off). */
+  features?: { laisEditingDone: boolean };
 }
 
 export type AppRole = "ADMINISTRATOR" | "GIS_EDITOR" | "SURVEYOR" | "VIEWER";

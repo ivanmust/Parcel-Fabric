@@ -42,6 +42,16 @@ const EnvSchema = z.object({
    */
   LAIS_WRITE_MODE: z.enum(["version-only", "attributes"]).default("version-only"),
   LAIS_DATA_DIR: z.string().default("data/lais"),
+  /**
+   * GIS → LAIS "editing done" notification. Off until the whole approval flow (LAIS endpoint, GIS
+   * approve endpoint) is ready: once on, editors stop posting LAIS versions and wait for approval.
+   */
+  LAIS_EDITING_DONE: z.enum(["true", "false"]).default("false"),
+  /** The LAIS endpoint that receives the notification (POST, JSON). */
+  LAIS_WEBHOOK_URL: z.union([z.literal(""), z.url()]).default(""),
+  /** The key LAIS issued to GIS, sent as X-API-Key. */
+  LAIS_WEBHOOK_KEY: z.string().default(""),
+  LAIS_WEBHOOK_TIMEOUT_MS: z.coerce.number().int().min(1000).max(60_000).default(10_000),
   /** Serve the OpenAPI description and Swagger UI at /api/docs. Default: on, except in production. */
   API_DOCS: z.enum(["true", "false"]).optional(),
 });
