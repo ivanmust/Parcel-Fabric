@@ -409,12 +409,16 @@ describe("successful submission", () => {
     assert.equal("transaction_status" in update, false);
   });
 
-  test("identical retry → 200 duplicate, no new version or edit", async () => {
+  test("identical retry → 409 ALREADY_RECORDED with the transaction in data, no new version or edit", async () => {
     await submit(valid);
     fake.calls = [];
     const r = await submit(valid);
-    assert.equal(r.status, 200);
-    assert.equal(r.body.data.duplicate, true);
+    assert.equal(r.status, 409);
+    assert.equal(r.body.success, false);
+    assert.equal(r.body.case, "No");
+    assert.deepEqual(codes(r.body), ["ALREADY_RECORDED"]);
+    assert.equal(r.body.data.Transaction_ID, valid.Transaction_ID);
+    assert.equal(r.body.data.stage, "InReview");
     assert.equal(gisCalls("/create").length + gisCalls("/applyEdits").length, 0);
   });
 
@@ -427,14 +431,15 @@ describe("successful submission", () => {
 
   test("concurrent identical submissions create one version", async () => {
     const results = await Promise.all([submit(valid), submit(valid), submit(valid)]);
-    assert.deepEqual(results.map((r) => r.status).sort(), [200, 200, 201]);
+    assert.deepEqual(results.map((r) => r.status).sort(), [201, 409, 409]);
     assert.equal(fake.versions.length, 1);
   });
 
   test("Transaction_ID already posted to DEFAULT → duplicate (posted) or conflict", async () => {
     Object.assign(fake.plots.get(1)!, { transaction_id: "POSTED-1", transaction_type: "CorrectBoundaries", transaction_date: Date.parse(valid.Transaction_Date), case_: "Yes" });
     let r = await submit({ ...valid, Transaction_ID: "POSTED-1", Transaction_Type: "CorrectBoundaries" });
-    assert.equal(r.status, 200);
+    assert.equal(r.status, 409);
+    assert.deepEqual(codes(r.body), ["ALREADY_RECORDED"]);
     assert.equal(r.body.data.stage, "Posted");
     r = await submit({ ...valid, Transaction_ID: "POSTED-1" });
     assert.equal(r.status, 409);
@@ -508,11 +513,11 @@ describe("version-only mode (default: LAIS account can read and create versions,
     assert.ok(fake.calls.every((c) => c.referer === `${REFERER}/`));
   });
 
-  test("identical retry → 200, different payload → 409, status → InReview", async () => {
+  test("identical retry → 409 ALREADY_RECORDED, different payload → 409, status → InReview", async () => {
     await submit(valid);
     let r = await submit(valid);
-    assert.equal(r.status, 200);
-    assert.equal(r.body.data.duplicate, true);
+    assert.equal(r.status, 409);
+    assert.deepEqual(codes(r.body), ["ALREADY_RECORDED"]);
     r = await submit({ ...valid, Transaction_Type: "CorrectBoundaries" });
     assert.equal(r.status, 409);
     const s = await status(valid.Transaction_ID);
@@ -528,7 +533,8 @@ describe("version-only mode (default: LAIS account can read and create versions,
     const s = await status(valid.Transaction_ID);
     assert.equal(s.body.data.stage, "Closed");
     const r = await submit(valid);
-    assert.equal(r.status, 200);
+    assert.equal(r.status, 409);
+    assert.deepEqual(codes(r.body), ["ALREADY_RECORDED"]);
     assert.equal(r.body.data.stage, "Closed");
     assert.equal(fake.versions.length, 0);
   });
@@ -631,11 +637,11 @@ describe("several parcels: UPIs (Merge, CorrectBoundaries, CreatePlot)", () => {
     assert.match(r.body.errors[0].message, /It is now 1\/02\/13\/02\/7007/);
   });
 
-  test("resending the same Merge (UPIs in any order) → 200 duplicate; other UPIs → 409", async () => {
+  test("resending the same Merge (UPIs in any order) → 409 ALREADY_RECORDED; other UPIs → 409", async () => {
     await submit(merge);
     let r = await submit({ ...merge, UPIs: [...merge.UPIs].reverse() });
-    assert.equal(r.status, 200);
-    assert.equal(r.body.data.duplicate, true);
+    assert.equal(r.status, 409);
+    assert.deepEqual(codes(r.body), ["ALREADY_RECORDED"]);
     r = await submit({ ...merge, UPIs: ["1/02/13/02/3003", "1/02/13/02/9009"] });
     assert.equal(r.status, 409);
   });
@@ -647,6 +653,58 @@ describe("several parcels: UPIs (Merge, CorrectBoundaries, CreatePlot)", () => {
     assert.equal(r.body.data.version_name, "svc_lais.CRPL-NEW-1-20261125");
     assert.match(gisCalls("/create")[0]!.params.description!, /new plot/);
     assert.equal(gisCalls("/applyEdits").length, 0);
+  });
+});
+
+describe("one open transaction per UPI", () => {
+  beforeEach(() => {
+    cfg.LAIS_WRITE_MODE = "version-only";
+  });
+  const other = { ...valid, Transaction_ID: "LAIS-COR-2026-00200", Transaction_Type: "CorrectBoundaries" };
+
+  test("a new Transaction_ID on a UPI that GIS has not finished → 409 UPI_IN_TRANSACTION, nothing created", async () => {
+    assert.equal((await submit(valid)).status, 201);
+    const r = await submit(other);
+    assert.equal(r.status, 409, JSON.stringify(r.body));
+    assert.equal(r.body.success, false);
+    assert.deepEqual(r.body.errors.map((e: any) => `${e.field}:${e.code}:${e.transactionId}`), [`UPI:UPI_IN_TRANSACTION:${valid.Transaction_ID}`]);
+    assert.match(r.body.errors[0].message, /SUBV-LAIS-SUB-2026-00125-20261124/);
+    assert.equal(fake.versions.length, 1);
+    const s = await fetch(`${base}/transactions/${other.Transaction_ID}`, { headers: { "x-api-key": KEY, ...client() } });
+    assert.equal(s.status, 404, "the refused transaction is not recorded");
+  });
+
+  test("a Merge naming a held parcel is refused at that parcel's position", async () => {
+    await submit(valid);
+    const r = await submit({ UPIs: ["1/02/13/02/3003", "1/02/13/02/1001"], Transaction_ID: "MRG-9", Transaction_Type: "Merge", Transaction_Date: "2026-11-25T10:00:00Z" });
+    assert.equal(r.status, 409, JSON.stringify(r.body));
+    assert.deepEqual(r.body.errors.map((e: any) => `${e.field}:${e.code}`), ["UPIs[1]:UPI_IN_TRANSACTION"]);
+  });
+
+  test("once the holding version is removed (Closed), the UPI is free again", async () => {
+    await submit(valid);
+    fake.versions = [];
+    const r = await submit(other);
+    assert.equal(r.status, 201, JSON.stringify(r.body));
+  });
+
+  test("once the holding transaction is posted (version kept), the UPI is free again", async () => {
+    await submit(other);
+    fake.records.push({ globalid: "{COR-REC-2}", name: "CORB-LAIS-COR-2026-00200-20261124" });
+    const r = await submit({ ...valid, Transaction_ID: "LAIS-COR-2026-00201", Transaction_Type: "CorrectBoundaries" });
+    assert.equal(r.status, 201, JSON.stringify(r.body));
+  });
+
+  test("two new transactions on the same UPI at the same time: one 201, one 409", async () => {
+    const results = await Promise.all([submit(valid), submit(other)]);
+    assert.deepEqual(results.map((r) => r.status).sort(), [201, 409]);
+    assert.equal(fake.versions.length, 1);
+  });
+
+  test("a CreatePlot without parcels never conflicts", async () => {
+    const plot = { Transaction_ID: "NEW-7", Transaction_Type: "CreatePlot", Transaction_Date: "2026-11-25T10:00:00Z" };
+    assert.equal((await submit(plot)).status, 201);
+    assert.equal((await submit({ ...plot, Transaction_ID: "NEW-8" })).status, 201);
   });
 });
 
@@ -762,12 +820,12 @@ describe("completion: LAIS sees when GIS has posted the change, and the resultin
     assert.ok(Date.parse(s.body.data.updated_at) > Date.parse(firstUpdate));
   });
 
-  test("resubmitting a posted Subdivision → 200 duplicate Posted, not UPI_EXPIRED", async () => {
+  test("resubmitting a posted Subdivision → 409 ALREADY_RECORDED with stage Posted, not UPI_EXPIRED", async () => {
     await submit(valid);
     postSubdivision("1/02/13/02/1102");
     const r = await submit(valid);
-    assert.equal(r.status, 200, JSON.stringify(r.body));
-    assert.equal(r.body.data.duplicate, true);
+    assert.equal(r.status, 409, JSON.stringify(r.body));
+    assert.deepEqual(codes(r.body), ["ALREADY_RECORDED"]);
     assert.equal(r.body.data.stage, "Posted");
     assert.equal(r.body.data.result.parcels.length, 2);
   });

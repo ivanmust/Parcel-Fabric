@@ -102,9 +102,15 @@ lais.post("/transactions", async (req, res) => {
     case "conflict":
       audit(req, input.Transaction_ID, "failure", { UPIs: input.UPIs, errors: outcome.errors.map((e) => e.code) });
       return laisFailure(req, res, 409, "Transaction_ID conflict", outcome.errors);
-    case "duplicate":
-      audit(req, input.Transaction_ID, "success", { UPIs: input.UPIs, duplicate: true, version: outcome.record.version_name });
-      return res.status(200).json({ success: true, case: "Yes", message: "This transaction was already recorded.", data: { ...outcome.record, duplicate: true } });
+    case "busy":
+      audit(req, input.Transaction_ID, "failure", { UPIs: input.UPIs, errors: outcome.errors.map((e) => e.code), heldBy: outcome.errors.map((e) => e.transactionId) });
+      return laisFailure(req, res, 409, "A parcel is already in another transaction that GIS has not finished.", outcome.errors);
+    case "duplicate": {
+      // Not created again: a clear failure, with the transaction as it stands in `data`.
+      audit(req, input.Transaction_ID, "failure", { UPIs: input.UPIs, code: "ALREADY_RECORDED", version: outcome.record.version_name, stage: outcome.record.stage });
+      const errors: FieldError[] = [{ field: "Transaction_ID", code: "ALREADY_RECORDED", message: `This Transaction_ID was already recorded (stage ${outcome.record.stage}); nothing new was created. Its current state is in data, or GET /transactions/{Transaction_ID}.` }];
+      return res.status(409).json({ success: false, case: "No", message: "This transaction was already recorded.", errors, data: outcome.record, requestId: req.id });
+    }
     case "created":
       audit(req, input.Transaction_ID, "success", { UPIs: input.UPIs, version: outcome.record.version_name });
       return res.status(201).json({ success: true, case: "Yes", message: "Transaction validated and recorded in a GIS version for review.", data: outcome.record });

@@ -217,8 +217,14 @@ paths:
         that Plot **inside the version** (`case_ = Yes`, `version_status = VersionCreated`). sde.DEFAULT is
         never edited; GIS editors review, reconcile and post the version.
 
-        Idempotent by `Transaction_ID`: an identical retry returns 200 with `duplicate: true`; the same ID
-        with a different payload returns 409. After a 5xx, resubmit the same payload.
+        Only a **201** means a new transaction was recorded. Every refusal has `success: false`, `case: "No"`:
+        - **409 ALREADY_RECORDED**: this Transaction_ID was recorded before; nothing new was created. `data` holds
+          the transaction as it stands (stage InReview, Posted or Closed). A retry after a lost response gets this.
+        - **409 UPI_IN_TRANSACTION**: one open transaction per UPI. The parcel is in another transaction whose GIS
+          version is not posted or removed yet; `errors[].transactionId` names it. Resubmit once that one is
+          Posted or Closed.
+        - **409 DUPLICATE_TRANSACTION_ID**: the same Transaction_ID with a different payload.
+        After a 5xx, resubmit the same payload.
       security:
         - laisApiKey: []
       requestBody:
@@ -233,14 +239,25 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/LaisSuccess" }
-        "200":
-          description: Identical retry of a transaction already recorded (`data.duplicate` is true)
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/LaisSuccess" }
         "400": { $ref: "#/components/responses/LaisFailure" }
         "401": { $ref: "#/components/responses/LaisFailure" }
-        "409": { $ref: "#/components/responses/LaisFailure" }
+        "409":
+          description: Not recorded again (ALREADY_RECORDED, with the existing transaction in `data`), the UPI is in another open transaction (UPI_IN_TRANSACTION), or the Transaction_ID was used with a different payload (DUPLICATE_TRANSACTION_ID)
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/responses/LaisFailure/content/application~1json/schema"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/LaisTransaction", description: "ALREADY_RECORDED only: the transaction as it stands" }
+              examples:
+                alreadyRecorded:
+                  summary: Same Transaction_ID sent again
+                  value: { success: false, case: "No", message: "This transaction was already recorded.", errors: [{ field: "Transaction_ID", code: "ALREADY_RECORDED", message: "This Transaction_ID was already recorded (stage InReview); nothing new was created. Its current state is in data, or GET /transactions/{Transaction_ID}." }], data: { UPI: "1/02/13/02/1001", UPIs: ["1/02/13/02/1001"], Transaction_ID: "LAIS-SUB-2026-00125", Transaction_Type: "Subdivision", stage: "InReview", version_name: "qt_testing.SUBV-LAIS-SUB-2026-00125-20261124" }, requestId: "3f1c2a7e-0d5b-4139-9de0-c86997056829" }
+                upiInTransaction:
+                  summary: Another Transaction_ID on a UPI that GIS has not finished
+                  value: { success: false, case: "No", message: "A parcel is already in another transaction that GIS has not finished.", errors: [{ field: "UPI", code: "UPI_IN_TRANSACTION", transactionId: "LAIS-SUB-2026-00125", message: "UPI 1/02/13/02/1001 is already in transaction LAIS-SUB-2026-00125 (Subdivision, GIS version qt_testing.SUBV-LAIS-SUB-2026-00125-20261124), which GIS has not finished. Submit a new transaction for this parcel once that one is Posted or Closed." }], requestId: "3f1c2a7e-0d5b-4139-9de0-c86997056829" }
         "413": { $ref: "#/components/responses/LaisFailure" }
         "422": { $ref: "#/components/responses/LaisFailure" }
         "429": { $ref: "#/components/responses/LaisFailure" }
@@ -410,7 +427,7 @@ components:
 
   responses:
     LaisFailure:
-      description: "Not recorded. errors[].code says why: REQUIRED_FIELD, INVALID_TYPE, TOO_LONG, TOO_LONG_FOR_GIS (attributes mode only), UNKNOWN_FIELD, INVALID_UPI_FORMAT, INVALID_FORMAT, INVALID_TRANSACTION_TYPE, INVALID_TRANSACTION_STATUS, INVALID_DATE, PARCEL_NOT_FOUND, UPI_EXPIRED (replacedBy lists the current UPIs), UPI_NOT_UNIQUE, NOT_NEIGHBOURS, MERGE_NEEDS_TWO_UPIS, SUBDIVISION_NEEDS_ONE_UPI, CONFLICTING_FIELDS, DUPLICATE_UPI, DUPLICATE_TRANSACTION_ID, NOT_FOUND, INVALID_TRANSACTION_ID, UNAUTHORIZED, INVALID_JSON, PAYLOAD_TOO_LARGE, RATE_LIMITED, GIS_UNAVAILABLE, GIS_NOT_CONFIGURED, INTERNAL_ERROR."
+      description: "Not recorded. errors[].code says why: REQUIRED_FIELD, INVALID_TYPE, TOO_LONG, TOO_LONG_FOR_GIS (attributes mode only), UNKNOWN_FIELD, INVALID_UPI_FORMAT, INVALID_FORMAT, INVALID_TRANSACTION_TYPE, INVALID_TRANSACTION_STATUS, INVALID_DATE, PARCEL_NOT_FOUND, UPI_EXPIRED (replacedBy lists the current UPIs), UPI_NOT_UNIQUE, NOT_NEIGHBOURS, MERGE_NEEDS_TWO_UPIS, SUBDIVISION_NEEDS_ONE_UPI, CONFLICTING_FIELDS, DUPLICATE_UPI, DUPLICATE_TRANSACTION_ID, ALREADY_RECORDED (data holds the existing transaction), UPI_IN_TRANSACTION (transactionId names the open transaction), NOT_FOUND, INVALID_TRANSACTION_ID, UNAUTHORIZED, INVALID_JSON, PAYLOAD_TOO_LARGE, RATE_LIMITED, GIS_UNAVAILABLE, GIS_NOT_CONFIGURED, INTERNAL_ERROR."
       content:
         application/json:
           schema:
@@ -429,6 +446,7 @@ components:
                     code: { type: string }
                     message: { type: string }
                     replacedBy: { type: array, items: { type: string }, description: "UPI_EXPIRED only: the current UPIs of the parcels that replaced the expired one" }
+                    transactionId: { type: string, description: "UPI_IN_TRANSACTION only: the open transaction that holds the parcel" }
               requestId: { type: string }
           example: { success: false, case: "No", message: "Validation failed", errors: [{ field: "UPI", code: "PARCEL_NOT_FOUND", message: "No parcel with this UPI exists in GIS." }], requestId: "3f1c2a7e-0d5b-4139-9de0-c86997056829" }
     BadRequest:
@@ -485,12 +503,7 @@ components:
         success: { type: boolean, const: true }
         case: { type: string, const: "Yes" }
         message: { type: string }
-        data:
-          allOf:
-            - $ref: "#/components/schemas/LaisTransaction"
-            - type: object
-              properties:
-                duplicate: { type: boolean, description: "Present on an identical retry" }
+        data: { $ref: "#/components/schemas/LaisTransaction" }
     LaisTransaction:
       type: object
       properties:

@@ -81,14 +81,16 @@ Field names are resolved case-insensitively from the live layer metadata; the AP
 ## Safety properties
 
 - `applyEdits` is only ever sent with `gdbVersion` + `sessionID` of the transaction's own version, as an attribute-only **update** of the one matched Plot. No adds, deletes or geometry changes. Nothing reconciles or posts.
-- **Idempotency key = `Transaction_ID`** (kept in the ledger, which also stores the version name). Identical retry → 200 `duplicate: true`; same ID, different payload → 409. A retry after a failure reuses the version created by the failed attempt.
+- **Only 201 means recorded.** Every other answer has `success: false`, `case: "No"`.
+- **`Transaction_ID` is recorded once** (kept in the ledger, which also stores the version name). Sending it again → 409 `ALREADY_RECORDED`, nothing created, with the transaction as it stands in `data` (so a retry after a lost response still learns its version and stage). Same ID, different payload → 409 `DUPLICATE_TRANSACTION_ID`. A retry after a 5xx reuses the version created by the failed attempt and gets 201.
+- **One open transaction per UPI.** A new Transaction_ID naming a parcel that another transaction holds → 409 `UPI_IN_TRANSACTION`, with `transactionId` naming the holder. A transaction holds its parcels while its version exists and its change is not in sde.DEFAULT; once GIS posts or removes the version, the parcel is free. The check and the recording happen one submission at a time, so two simultaneous transactions cannot both take a parcel.
 - A failed edit stops the session with `saveEdits=false` and releases the read lock.
 - Concurrent requests for the same `Transaction_ID` are serialised in-process.
 - Every submission (accepted or rejected) is written to the audit log as `lais.transaction.submit`.
 
 ## Known limitations / decisions still open
 
-- Two *different* Transaction_IDs for the same UPI get two versions; they will conflict at reconcile. Decide whether LAIS should be blocked from submitting a second transaction while one is in review.
+- A UPI is free again once its transaction's version is posted or removed. One exception: a CorrectBoundaries posted in `version-only` mode without a record named after the version can't be seen as posted, so its UPI stays held until GIS deletes the version.
 - Once a version is posted and a later transaction overwrites `transaction_id` on the same Plot, the earlier ID can no longer be found (it lives only in history/archive).
 - The in-process lock assumes one API instance. Run a single instance, or add a shared lock, before scaling out.
 - The service account owns the versions. To reconcile/post them, GIS editors need the Portal privilege to manage versions they don't own (version administrator), or an administrator does it.

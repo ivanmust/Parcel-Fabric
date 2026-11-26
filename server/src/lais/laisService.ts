@@ -27,6 +27,8 @@ export interface FieldError {
   message: string;
   /** UPI_EXPIRED: the current UPIs of the parcels that replaced the expired one. */
   replacedBy?: string[];
+  /** UPI_IN_TRANSACTION: the open transaction that holds the parcel. */
+  transactionId?: string;
 }
 
 export interface LaisRecord {
@@ -92,6 +94,8 @@ export type SubmitOutcome =
   | { kind: "created"; record: LaisRecord }
   | { kind: "duplicate"; record: LaisRecord }
   | { kind: "conflict"; errors: FieldError[] }
+  /** A parcel is in another transaction that GIS has not finished. */
+  | { kind: "busy"; errors: FieldError[] }
   | { kind: "invalid"; errors: FieldError[] };
 
 /** Thrown when the deployed service does not look like what this API was built for. */
@@ -727,6 +731,38 @@ async function withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
   }
 }
 
+/** Checking that a parcel is free and recording the new transaction on it happen one submission at a time. */
+const NEW_SUBMISSIONS = "\u0000new-submissions";
+
+/**
+ * One open transaction per parcel. Another accepted transaction holds a parcel while its version exists
+ * and its change is not in sde.DEFAULT; once GIS posts or removes that version, the parcel is free again
+ * (a posted Merge or Subdivision has expired its UPIs anyway).
+ */
+async function parcelsHeldElsewhere(token: string, schema: LayerSchema, input: LaisSubmission, objectIds: number[], fieldOf: (i: number) => string): Promise<FieldError[]> {
+  const mine = input.Transaction_ID.toLowerCase();
+  const wanted = new Set(objectIds);
+  const others = (await allEntries()).filter((e) => e.Transaction_ID.toLowerCase() !== mine && e.versionName && !e.completion && e.objectIds.some((id) => wanted.has(id)));
+  if (!others.length) return [];
+  const versions = await ownedVersions(token);
+  const errors: FieldError[] = [];
+  for (const other of others) {
+    if (!versions.has(shortVersionName(other.versionName!).toLowerCase())) continue; // posted or cancelled
+    const posted = await findPosted(token, schema, other.Transaction_ID);
+    if (await detectCompletion(token, schema, other, posted.rows)) continue; // posted, version kept
+    objectIds.forEach((id, i) => {
+      if (!other.objectIds.includes(id) || errors.some((e) => e.field === fieldOf(i))) return;
+      errors.push({
+        field: fieldOf(i),
+        code: "UPI_IN_TRANSACTION",
+        message: `UPI ${input.UPIs[i]} is already in transaction ${other.Transaction_ID} (${other.Transaction_Type}, GIS version ${other.versionName}), which GIS has not finished. Submit a new transaction for this parcel once that one is Posted or Closed.`,
+        transactionId: other.Transaction_ID,
+      });
+    });
+  }
+  return errors;
+}
+
 // ---------------------------------------------------------------- public API
 
 /** `listForm`: the parcels came as `UPIs`, so per-parcel errors name `UPIs[i]` (else `UPI`). */
@@ -786,45 +822,51 @@ export async function submitTransaction(token: string, input: LaisSubmission, li
 
     // An entry made before a naming change keeps the version name it was given.
     const shortName = entry?.versionName ? shortVersionName(entry.versionName) : versionNameFor(input);
-    let version = await findVersion(token, shortName);
     // The API takes any length, but writing to the Plot (attributes mode) must fit its transaction_id field.
     const idRoom = schema.lengths.transactionId;
     if (writeAttributes && idRoom && input.Transaction_ID.length > idRoom && !entry?.attributesWritten) {
       return { kind: "invalid", errors: [{ field: "Transaction_ID", code: "TOO_LONG_FOR_GIS", message: `GIS stores Transaction_ID on the parcel in a field of ${idRoom} characters; this one has ${input.Transaction_ID.length}. Contact the GIS integration administrator.` }] };
     }
 
-    if (entry?.versionName && !version) {
-      // Its version was posted or deleted by GIS: report what happened. Never recreate it.
-      return { kind: "duplicate", record: await describeEntry(token, schema, entry, null, posted.rows) };
-    }
-    if (!entry && version) {
-      return { kind: "conflict", errors: duplicateIdError(`GIS version ${shortName} already exists for another submission. Contact the GIS integration administrator.`) };
-    }
+    return withLock(NEW_SUBMISSIONS, async (): Promise<SubmitOutcome> => {
+      let version = await findVersion(token, shortName);
+      if (entry?.versionName && !version) {
+        // Its version was posted or deleted by GIS: report what happened. Never recreate it.
+        return { kind: "duplicate", record: await describeEntry(token, schema, entry, null, posted.rows) };
+      }
+      if (!entry && version) {
+        return { kind: "conflict", errors: duplicateIdError(`GIS version ${shortName} already exists for another submission. Contact the GIS integration administrator.`) };
+      }
 
-    // 3. New transaction, or the completion of an earlier attempt that failed part-way.
-    //    Record the intent first so a failure after version creation is recoverable on retry.
-    let current = entry ?? (await putEntry({ ...input, objectIds, versionName: null, attributesWritten: false }));
-    const parcelText = input.UPIs.length ? `UPI ${input.UPIs[0]}${input.UPIs.length > 1 ? ` +${input.UPIs.length - 1}` : ""}` : "new plot";
-    version ??= await createVersion(token, shortName, `LAIS ${input.Transaction_Type} ${parcelText} ${input.Transaction_ID}`);
-    current = await putEntry({ ...current, versionName: version.name });
+      // One open transaction per parcel.
+      const held = await parcelsHeldElsewhere(token, schema, input, objectIds, fieldOf);
+      if (held.length) return { kind: "busy", errors: held };
 
-    // Write the transaction on every parcel of it, inside the version (a CreatePlot without parent has none).
-    if (writeAttributes && !current.attributesWritten && objectIds.length) {
-      const fields = {
-        [f.transactionId]: input.Transaction_ID,
-        [f.transactionType]: input.Transaction_Type,
-        [f.transactionDate]: Date.parse(input.Transaction_Date),
-        [f.case]: "Yes",
-        [f.validationMessage]: VALIDATED,
-        [f.versionStatus]: "VersionCreated",
-        [f.versionName]: version.name,
-        ...(input.Transaction_Status ? { [f.transactionStatus]: input.Transaction_Status } : {}),
-      };
-      await editInVersion(token, version, objectIds.map((objectId) => ({ [schema.objectIdField]: objectId, ...fields })));
-      current = await putEntry({ ...current, attributesWritten: true });
-    }
-    logger.info({ transactionId: input.Transaction_ID, version: version.name, objectIds, mode: config.LAIS_WRITE_MODE }, "LAIS transaction accepted");
-    return { kind: "created", record: entryRecord(current, "InReview") };
+      // 3. New transaction, or the completion of an earlier attempt that failed part-way.
+      //    Record the intent first so a failure after version creation is recoverable on retry.
+      let current = entry ?? (await putEntry({ ...input, objectIds, versionName: null, attributesWritten: false }));
+      const parcelText = input.UPIs.length ? `UPI ${input.UPIs[0]}${input.UPIs.length > 1 ? ` +${input.UPIs.length - 1}` : ""}` : "new plot";
+      version ??= await createVersion(token, shortName, `LAIS ${input.Transaction_Type} ${parcelText} ${input.Transaction_ID}`);
+      current = await putEntry({ ...current, versionName: version.name });
+
+      // Write the transaction on every parcel of it, inside the version (a CreatePlot without parent has none).
+      if (writeAttributes && !current.attributesWritten && objectIds.length) {
+        const fields = {
+          [f.transactionId]: input.Transaction_ID,
+          [f.transactionType]: input.Transaction_Type,
+          [f.transactionDate]: Date.parse(input.Transaction_Date),
+          [f.case]: "Yes",
+          [f.validationMessage]: VALIDATED,
+          [f.versionStatus]: "VersionCreated",
+          [f.versionName]: version.name,
+          ...(input.Transaction_Status ? { [f.transactionStatus]: input.Transaction_Status } : {}),
+        };
+        await editInVersion(token, version, objectIds.map((objectId) => ({ [schema.objectIdField]: objectId, ...fields })));
+        current = await putEntry({ ...current, attributesWritten: true });
+      }
+      logger.info({ transactionId: input.Transaction_ID, version: version.name, objectIds, mode: config.LAIS_WRITE_MODE }, "LAIS transaction accepted");
+      return { kind: "created", record: entryRecord(current, "InReview") };
+    });
   });
 }
 
