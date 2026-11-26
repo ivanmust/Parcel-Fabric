@@ -42,8 +42,6 @@ tags:
     description: Saved map views per user
   - name: LAIS
     description: LAIS transaction intake (server-to-server, X-API-Key)
-  - name: Webhooks
-    description: Subdivision completion webhook to App B (administrators); contract in docs/SUBDIVISION-WEBHOOK.md
   - name: LAIS editing
     description: GIS editors send a LAIS transaction's finished work to LAIS for the registrar's approval (switch LAIS_EDITING_DONE)
   - name: Diagnostics
@@ -604,40 +602,6 @@ paths:
         "202": { description: Not delivered yet (retrying) or refused by LAIS }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
-
-  /webhooks/subdivision/events:
-    get:
-      tags: [Webhooks]
-      operationId: listSubdivisionWebhookEvents
-      summary: Subdivision completion events in the outbox (newest first)
-      description: Requires admin:audit. Shows payloads, delivery state and attempt history; never signing keys.
-      parameters:
-        - { name: status, in: query, required: false, schema: { type: string, enum: [pending, delivering, delivered, dead] } }
-      responses:
-        "200": { description: "enabled, events" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "403": { $ref: "#/components/responses/Forbidden" }
-  /webhooks/subdivision/waiting:
-    get:
-      tags: [Webhooks]
-      operationId: listSubdivisionWebhookWaiting
-      summary: Posted subdivisions whose event waits for complete data (e.g. a missing UPI)
-      responses:
-        "200": { description: "waiting: key, since, lastCheckedAt, checks, reason" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "403": { $ref: "#/components/responses/Forbidden" }
-  /webhooks/subdivision/events/{eventId}/replay:
-    post:
-      tags: [Webhooks]
-      operationId: replaySubdivisionWebhookEvent
-      summary: Queue a dead-lettered event again (after fixing the cause)
-      parameters:
-        - { name: eventId, in: path, required: true, schema: { type: string } }
-      responses:
-        "200": { description: The event, pending again }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "403": { $ref: "#/components/responses/Forbidden" }
-        "409": { description: The event is not dead-lettered }
 
 security:
   - bearerAuth: []
