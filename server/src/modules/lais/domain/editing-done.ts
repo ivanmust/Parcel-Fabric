@@ -120,6 +120,8 @@ async function workInVersion(token: string, schema: LayerSchema, version: Versio
   return { newIds: changes.inserts, changedIds: changes.updates };
 }
 
+const WORK_NAMES: Record<string, string> = { Subdivision: "subdivision", Merge: "merge", CorrectBoundaries: "boundary correction", CreatePlot: "new plot" };
+
 const listOf = (upis: string[]) => (upis.length > 1 ? `parcels ${upis.join(", ")} are` : `parcel ${upis[0]} is`);
 
 /**
@@ -149,7 +151,7 @@ export async function buildFor(token: string, entry: LedgerEntry, editedBy: stri
   const parentRows = entry.objectIds.length ? await plots(token, schema, `${oid} IN (${entry.objectIds.join(",")})`, inPlace ? undefined : version.name, false) : [];
 
   const n = proposedRows.length;
-  const action = type.toLowerCase();
+  const action = WORK_NAMES[type] ?? type.toLowerCase();
   if (inPlace && !work.changedIds.some((id) => ours.has(id))) problems.push(`The version does not change the transaction's parcels yet. Do the ${action} in the version and save your edits.`);
   else if (!n) problems.push(`The version has no new parcels yet. Do the ${action} in the version ${version.name} and save your edits.`);
   else if (type === "Subdivision" && n < 2) problems.push(`A subdivision must produce at least 2 parcels; the version has ${n} new parcel.`);

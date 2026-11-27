@@ -9,7 +9,7 @@
     "typecheck": "tsc -b --noEmit",
     "lint": "eslint .",
     "preview": "vite preview --port 5174",
-    "test:unit": "node --test tests/unit/shapefile.test.mjs tests/unit/adjacency.test.mjs tests/unit/topologyErrors.test.mjs",
+    "test:unit": "node --test tests/unit/shapefile.test.mjs tests/unit/adjacency.test.mjs tests/unit/topologyErrors.test.mjs tests/unit/editingDoneNotice.test.mjs",
     "test:e2e:workspace": "node tests/e2e/workspace-test.mjs",
     "test:e2e:search": "node tests/e2e/search-test.mjs",
     "test:e2e:phase2": "node tests/e2e/phase2-ui.mjs",

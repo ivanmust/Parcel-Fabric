@@ -7,6 +7,9 @@ import { editorBridge, isEditorWorkflowActive } from "../gis/editing/editorBridg
 import type { MapTool } from "../types/app";
 import { parcelFabricService } from "../gis/parcel-fabric/parcelFabricService";
 import { manualSplit } from "../gis/parcel-fabric/manualSplit";
+import { isLaisVersionName } from "../gis/version-management/laisVersions";
+import { sendEditingDoneAfterSave } from "../services/lais/editingDoneOnSave";
+import { afterSaveNotice } from "../services/lais/editingDoneNotice";
 
 const onlyParcelsSelected = (selection: { layerKey: string }[]) =>
   selection.length === 1 && parcelFabricService.isParcelLayer(selection[0]!.layerKey);
@@ -21,6 +24,19 @@ async function guarded(label: string, fn: () => Promise<unknown>) {
     await fn();
   } catch (e) {
     useApp.getState().notify("warning", label, (e as Error).message);
+  }
+}
+
+/** Save; on a LAIS transaction's version, then tell LAIS the work is done (Editing done). */
+async function saveAndSendEditingDone(versionName: string | null) {
+  await versionSession.save();
+  const lais = useApp.getState().config?.features?.laisEditingDone && isLaisVersionName(versionName);
+  if (!lais || !versionName) return;
+  try {
+    const notice = afterSaveNotice(await sendEditingDoneAfterSave(versionName));
+    if (notice) useApp.getState().notify(notice.kind, notice.title, notice.message);
+  } catch (e) {
+    useApp.getState().notify("warning", "Saved, but Editing done failed", (e as Error).message);
   }
 }
 
@@ -91,7 +107,7 @@ export function runCommand(id: string): void {
       else void guarded("Cannot start editing", () => versionSession.startEditing());
       break;
     case "save":
-      if (editing) void guarded("Save failed", () => versionSession.save());
+      if (editing) void guarded("Save failed", () => saveAndSendEditingDone(ed.current?.name ?? null));
       break;
     case "discard":
       if (editing) requestConfirm("discard");
