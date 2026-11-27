@@ -79,7 +79,7 @@ const fake = {
   /** Records created inside a version (by full version name), not yet posted. */
   versionRecords: new Map<string, Attrs[]>(),
   /** What the LAIS "editing done" endpoint received, and the answers it gives (then 200). */
-  webhook: { calls: [] as Array<{ headers: Headers; body: Record<string, any> }>, answers: [] as Array<{ status: number; body?: unknown } | "timeout"> },
+  webhook: { calls: [] as Array<{ method: string; headers: Headers; body: Record<string, any> }>, answers: [] as Array<{ status: number; body?: unknown } | "timeout"> },
   /** The subdivision completion webhook receiver ("App B"). */
   appB: { calls: [] as Array<{ headers: Headers; raw: string }> },
   versions: [] as FakeVersion[],
@@ -154,6 +154,8 @@ const BOXES: Record<number, Box> = {
   5: [200, 0, 210, 10], 6: [0, 0, 10, 10], 7: [200, 0, 220, 10],
   // parcels the completion tests "post": 11+12 split 1; 13 is 1+4 merged; 14 a new plot far away
   11: [0, 0, 5, 10], 12: [5, 0, 10, 10], 13: [0, 0, 20, 10], 14: [500, 500, 510, 510],
+  // 15+16 split 8 (the approval tests' second transaction)
+  15: [100, 100, 105, 110], 16: [105, 100, 110, 110],
 };
 const ringsOf = ([x0, y0, x1, y1]: Box) => ({ rings: [[[x0, y0], [x0, y1], [x1, y1], [x1, y0], [x0, y0]]] });
 const boxOf = (ring: number[][]): Box => [Math.min(...ring.map((p) => p[0]!)), Math.min(...ring.map((p) => p[1]!)), Math.max(...ring.map((p) => p[0]!)), Math.max(...ring.map((p) => p[1]!))];
@@ -207,7 +209,7 @@ const realFetch = globalThis.fetch;
 globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
   const url = String(input instanceof Request ? input.url : input);
   if (url === WEBHOOK) {
-    fake.webhook.calls.push({ headers: new Headers(init?.headers), body: JSON.parse(String(init?.body)) });
+    fake.webhook.calls.push({ method: String(init?.method ?? "GET"), headers: new Headers(init?.headers), body: JSON.parse(String(init?.body)) });
     const answer = fake.webhook.answers.shift() ?? { status: 200, body: { received: true } };
     if (answer === "timeout") throw Object.assign(new Error("The operation was aborted due to timeout"), { name: "TimeoutError" });
     return json(answer.body ?? {}, answer.status);
@@ -338,6 +340,7 @@ globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) =>
 // ------------------------------------------------------------------ app under test
 
 let server: Server;
+let app: Awaited<ReturnType<typeof import("../src/app.factory.js").createApp>>;
 let base = "";
 let resetLais: () => Promise<void>;
 // Each test is its own client (the API trusts X-Forwarded-For from localhost), so the per-client rate limit is per test.
@@ -351,20 +354,22 @@ let cfg: {
   LAIS_EDITING_DONE: "true" | "false";
   LAIS_WEBHOOK_URL: string;
   LAIS_WEBHOOK_KEY: string;
+  LAIS_WEBHOOK_METHOD: "PUT" | "POST";
   SUBDIVISION_WEBHOOK_SINCE: string;
 };
 
 before(async () => {
-  const { createApp } = await import("../src/app.js");
+  const { createApp } = await import("../src/app.factory.js");
   ({ config: cfg } = await import("../src/config/env.js"));
-  ({ resetLaisCachesForTests: resetLais } = await import("../src/lais/laisService.js"));
-  ({ resetServiceTokenForTests: resetToken } = await import("../src/lais/arcgisClient.js"));
-  server = createApp().listen(0);
+  ({ resetLaisCachesForTests: resetLais } = await import("../src/modules/lais/testing.js"));
+  ({ resetServiceTokenForTests: resetToken } = await import("../src/common/arcgis/arcgis-client.js"));
+  app = await createApp();
+  server = app.getHttpServer().listen(0);
   await new Promise((r) => server.once("listening", r));
   base = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api/lais`;
 });
 after(() => {
-  server?.close();
+  void app?.close();
   rmSync(auditDir, { recursive: true, force: true });
 });
 // Most suites exercise the full "attributes" mode; the "version-only" suite switches to the default mode.
@@ -377,6 +382,7 @@ beforeEach(async () => {
   cfg.LAIS_EDITING_DONE = "false";
   cfg.LAIS_WEBHOOK_URL = WEBHOOK;
   cfg.LAIS_WEBHOOK_KEY = WEBHOOK_KEY;
+  cfg.LAIS_WEBHOOK_METHOD = "PUT";
   clientIp = `10.0.${Math.floor(++clientNo / 250)}.${clientNo % 250}`;
 });
 
@@ -393,7 +399,7 @@ const gisCalls = (suffix: string) => fake.calls.filter((c) => c.url.endsWith(suf
 
 describe("version name {TYPE}-{CASE_NUMBER}-{DATE}", () => {
   test("type code, case number and transaction date", async () => {
-    const { versionNameFor } = await import("../src/lais/laisService.js");
+    const { versionNameFor } = await import("../src/modules/lais/testing.js");
     const at = "2026-11-25T10:00:00+02:00";
     assert.equal(versionNameFor({ Transaction_ID: "CASE123", Transaction_Type: "Subdivision", Transaction_Date: at }), "SUBV-CASE123-20261125");
     assert.equal(versionNameFor({ Transaction_ID: "CASE456", Transaction_Type: "Merge", Transaction_Date: at }), "MERG-CASE456-20261125");
@@ -403,7 +409,7 @@ describe("version name {TYPE}-{CASE_NUMBER}-{DATE}", () => {
     assert.equal(versionNameFor({ Transaction_ID: "C1", Transaction_Type: "Merge", Transaction_Date: "2026-11-25T00:30:00+02:00" }), "MERG-C1-20261125");
   });
   test("unsafe characters become '-', and the name never exceeds 62 characters", async () => {
-    const { versionNameFor } = await import("../src/lais/laisService.js");
+    const { versionNameFor } = await import("../src/modules/lais/testing.js");
     assert.equal(versionNameFor({ Transaction_ID: "RW/2026:0012.A", Transaction_Type: "Subdivision", Transaction_Date: "2026-11-25T10:00:00Z" }), "SUBV-RW-2026-0012-A-20261125");
     const long = versionNameFor({ Transaction_ID: "X".repeat(50), Transaction_Type: "Subdivision", Transaction_Date: "2026-11-25T10:00:00Z" });
     assert.equal(long.length, 62);
@@ -495,6 +501,7 @@ describe("successful submission", () => {
     assert.equal(r.body.data.version_status, "VersionCreated");
     assert.equal(r.body.data.version_name, "svc_lais.SUBV-LAIS-SUB-2026-00125-20261124");
     assert.equal(r.body.data.stage, "InReview");
+    assert.match(r.body.message, /transaction fields are written on the parcel\(s\) in the Plot table, inside that version/);
 
     const [create] = gisCalls("/create");
     assert.equal(create!.params.accessPermission, "public");
@@ -604,7 +611,7 @@ describe("failure handling", () => {
   });
 });
 
-describe("version-only mode (default: LAIS account can read and create versions, not edit)", () => {
+describe("version-only mode (LAIS account can read and create versions, not edit)", () => {
   beforeEach(() => {
     cfg.LAIS_WRITE_MODE = "version-only";
   });
@@ -621,6 +628,7 @@ describe("version-only mode (default: LAIS account can read and create versions,
     assert.equal(r.body.case, "Yes");
     assert.equal(r.body.data.version_status, "VersionCreated");
     assert.match(r.body.data.version_name, /^svc_lais\.SUBV-LAIS-SUB-2026-00125-20261124$/);
+    assert.match(r.body.message, /not written on the Plot table \(LAIS_WRITE_MODE is version-only\)/);
     assert.equal(gisCalls("/create")[0]!.params.accessPermission, "public");
     assert.deepEqual(editCalls(), []);
     assert.equal(fake.plots.get(1)!.transaction_id, undefined, "DEFAULT must be untouched");
@@ -654,7 +662,7 @@ describe("version-only mode (default: LAIS account can read and create versions,
   });
 
   test("a version that exists without an API record is not adopted silently → 409", async () => {
-    fake.versions.push({ name: `${OWNER}.${(await import("../src/lais/laisService.js")).versionNameFor(valid)}`, guid: "{00000000-0000-0000-0000-000000000001}", access: "public", saved: new Map(), pending: null });
+    fake.versions.push({ name: `${OWNER}.${(await import("../src/modules/lais/testing.js")).versionNameFor(valid)}`, guid: "{00000000-0000-0000-0000-000000000001}", access: "public", saved: new Map(), pending: null });
     const r = await submit(valid);
     assert.equal(r.status, 409);
   });
@@ -1063,7 +1071,7 @@ describe("editing done: GIS tells LAIS the work is ready for the registrar", () 
   };
 
   before(async () => {
-    ({ deliverDueEditingDone: deliverDue } = await import("../src/lais/editingDone.js"));
+    ({ deliverDueEditingDone: deliverDue } = await import("../src/modules/lais/domain/editing-done.js"));
   });
   beforeEach(async () => {
     cfg.LAIS_EDITING_DONE = "true";
@@ -1089,35 +1097,49 @@ describe("editing done: GIS tells LAIS the work is ready for the registrar", () 
     assert.equal((await editing("/transactions", { token: "viewer-token" })).status, 403);
   });
 
-  test("preview also opens with the LAIS API key (e.g. Swagger); only preview, and a wrong key is refused", async () => {
+  test("the API key opens every editing endpoint; a wrong key is refused, even next to a valid token", async () => {
     subdivideInVersion();
-    const preview = `${editingBase()}/transactions/${valid.Transaction_ID}/preview`;
-    const withKey = await fetch(preview, { headers: { "x-api-key": KEY, ...client() } });
-    assert.equal(withKey.status, 200);
-    assert.equal(((await withKey.json()) as Record<string, any>).payload.version_name, VERSION);
-    assert.equal((await fetch(preview, { headers: { "x-api-key": "wrong", ...client() } })).status, 401);
-    // A wrong key is refused even with a valid editor token next to it.
-    assert.equal((await fetch(preview, { headers: { "x-api-key": "wrong", Authorization: "Bearer editor-token", ...client() } })).status, 401);
-    assert.equal((await fetch(preview, { headers: client() })).status, 401);
-    assert.equal((await editing(`/transactions/${valid.Transaction_ID}/preview`, { token: "viewer-token" })).status, 403);
-    // The key opens nothing else under /lais-editing.
-    assert.equal((await fetch(`${editingBase()}/transactions`, { headers: { "x-api-key": KEY, ...client() } })).status, 401);
-    const send = await fetch(`${editingBase()}/transactions/${valid.Transaction_ID}/editing-done`, {
-      method: "POST",
-      headers: { "x-api-key": KEY, "Content-Type": "application/json", ...client() },
-      body: "{}",
-    });
-    assert.equal(send.status, 401);
-    assert.equal(fake.webhook.calls.length, 0);
+    const withKey = (path: string, init: RequestInit = {}) =>
+      fetch(`${editingBase()}${path}`, { ...init, headers: { "x-api-key": KEY, "Content-Type": "application/json", ...client(), ...(init.headers as Record<string, string>) } });
+    const preview = `/transactions/${valid.Transaction_ID}/preview`;
+
+    const previewed = await withKey(preview);
+    assert.equal(previewed.status, 200);
+    const payload = (await previewed.json()) as Record<string, any>;
+    assert.equal(payload.version_name, VERSION);
+    assert.equal(payload.edited_by, "", "no person is signed in with the key");
+    assert.equal((await withKey("/transactions")).status, 200);
+
+    assert.equal((await withKey(preview, { headers: { "x-api-key": "wrong" } })).status, 401);
+    assert.equal((await withKey(preview, { headers: { "x-api-key": "wrong", Authorization: "Bearer editor-token" } })).status, 401);
+    assert.equal((await fetch(`${editingBase()}${preview}`, { headers: client() })).status, 401);
+    assert.equal((await editing(preview, { token: "viewer-token" })).status, 403);
+
+    const sent = await withKey(`/transactions/${valid.Transaction_ID}/editing-done`, { method: "POST", body: "{}" });
+    assert.equal(sent.status, 200, await sent.clone().text());
+    assert.equal(fake.webhook.calls.length, 1);
+    assert.equal(fake.webhook.calls[0]!.body.edited_by, "");
   });
 
-  test("preview: the agreed format, built from the version, and nothing sent", async () => {
+  test("the API key also opens the web-app endpoints, as one fixed API client identity", async () => {
+    const api = base.replace(/\/lais$/, "");
+    const session = (await (await fetch(`${api}/auth/session`, { headers: { "x-api-key": KEY, ...client() } })).json()) as Record<string, any>;
+    assert.equal(session.user.username, "api-key");
+    assert.equal(session.user.appRole, "API_CLIENT");
+    assert.equal((await fetch(`${api}/audit`, { headers: { "x-api-key": KEY, ...client() } })).status, 200);
+    assert.equal((await fetch(`${api}/audit`, { headers: client() })).status, 401);
+  });
+
+  test("preview: the notification in the format LAIS receives it, built from the version, and nothing sent", async () => {
     subdivideInVersion();
     const r = await editing(`/transactions/${valid.Transaction_ID}/preview`);
     assert.equal(r.status, 200, JSON.stringify(r.body));
-    assert.deepEqual(r.body.problems, []);
-    const p = r.body.payload;
-    assert.deepEqual(Object.keys(p), ["event_type", "Transaction_ID", "Transaction_Type", "version_name", "record_name", "edited_by", "parent_parcels", "proposed_parcels", "totals"]);
+    const p = r.body;
+    assert.deepEqual(Object.keys(p), ["event_id", "event_type", "sent_at", "Transaction_ID", "Transaction_Type", "version_name", "record_name", "edited_by", "parent_parcels", "proposed_parcels", "totals", "warnings"]);
+    assert.equal(p.event_id, null, "not sent yet");
+    assert.equal(p.sent_at, null);
+    assert.equal(p.event_type, "editing.completed");
+    assert.equal(p.Transaction_ID, valid.Transaction_ID);
     assert.equal(p.version_name, VERSION);
     assert.equal(p.record_name, RECORD);
     assert.equal(p.edited_by, "editor.one");
@@ -1127,10 +1149,29 @@ describe("editing done: GIS tells LAIS the work is ready for the registrar", () 
     // GeoJSON: outer ring counter-clockwise (ArcGIS gives it clockwise)
     assert.deepEqual(p.proposed_parcels[0].geometry, { type: "Polygon", coordinates: [[[0, 0], [5, 0], [5, 10], [0, 10], [0, 0]]] });
     assert.deepEqual(p.totals, { parent_area_sqm: 100, proposed_area_sqm: 100 });
+    assert.deepEqual(p.warnings, []);
     assert.equal(fake.webhook.calls.length, 0);
-    const recordReads = fake.calls.filter((c) => c.url === `${RECORDS}/query`);
-    assert.ok(recordReads.length && recordReads.every((c) => c.params.gdbVersion === VERSION), "records are read in the version");
+    assert.equal(gisCalls("/differences").length, 1, "the work is read from the version's own changes");
+    assert.ok(fake.calls.filter((c) => c.url === `${PLOT}/query` && c.params.where?.includes("IN (11,12)")).every((c) => c.params.gdbVersion === VERSION), "new parcels are read in the version");
     assert.ok(gisCalls("/applyEdits").length === 0 && gisCalls("/startEditing").length === 0, "nothing is edited");
+  });
+
+  test("preview after sending: exactly what LAIS received, with its event_id and sent_at", async () => {
+    subdivideInVersion();
+    assert.equal((await done()).status, 200);
+    const sent = fake.webhook.calls[0]!.body;
+    const res = await fetch(`${editingBase()}/transactions/${valid.Transaction_ID}/preview`, { headers: { "x-api-key": KEY, ...client() } });
+    assert.equal(res.status, 200);
+    const { warnings, ...notification } = (await res.json()) as Record<string, any>;
+    assert.deepEqual(notification, sent);
+    assert.deepEqual(warnings, []);
+  });
+
+  test("preview of unfinished work: 422 not_ready with the problems to fix", async () => {
+    const r = await editing(`/transactions/${valid.Transaction_ID}/preview`);
+    assert.equal(r.status, 422);
+    assert.equal(r.body.error.code, "not_ready");
+    assert.ok(r.body.error.details.problems.length);
   });
 
   test("editing done: LAIS receives exactly the agreed message once; LAIS's view of the transaction does not change", async () => {
@@ -1141,6 +1182,7 @@ describe("editing done: GIS tells LAIS the work is ready for the registrar", () 
     assert.equal(r.body.editing_done.status, "delivered");
     assert.equal(fake.webhook.calls.length, 1);
     const call = fake.webhook.calls[0]!;
+    assert.equal(call.method, "PUT", "LAIS asked for PUT");
     assert.equal(call.headers.get("x-api-key"), WEBHOOK_KEY);
     assert.equal(call.headers.get("x-gis-event-type"), "editing.completed");
     assert.equal(call.headers.get("x-gis-event-id"), call.body.event_id);
@@ -1160,6 +1202,16 @@ describe("editing done: GIS tells LAIS the work is ready for the registrar", () 
     assert.equal(after.data.updated_at, before.data.updated_at, "LAIS's polling must not see a change");
   });
 
+  test("the method comes from LAIS_WEBHOOK_METHOD (PUT by default); retries use it too", async () => {
+    subdivideInVersion();
+    cfg.LAIS_WEBHOOK_METHOD = "POST";
+    fake.webhook.answers.push({ status: 503 });
+    assert.equal((await done()).status, 202);
+    await deliverDue(Date.now() + 2 * 60_000);
+    assert.deepEqual(fake.webhook.calls.map((c) => c.method), ["POST", "POST"]);
+    assert.equal(fake.webhook.calls[0]!.body.event_id, fake.webhook.calls[1]!.body.event_id, "a retry keeps the event_id");
+  });
+
   test('the button also writes editing_status = "Edits done" on the new parcels, in the version only', async () => {
     subdivideInVersion();
     const r = await done();
@@ -1174,7 +1226,7 @@ describe("editing done: GIS tells LAIS the work is ready for the registrar", () 
   describe('editors who set editing_status = "Edits done" themselves (e.g. ArcGIS Pro)', () => {
     let scan: (token: string) => Promise<string[]>;
     before(async () => {
-      ({ scanEditsDoneField: scan } = await import("../src/lais/editingDone.js"));
+      ({ scanEditsDoneField: scan } = await import("../src/modules/lais/domain/editing-done.js"));
     });
     const markInVersion = (ids: number[], editor = "pro.editor") => {
       const v = fake.versions.find((x) => x.name === VERSION)!;
@@ -1304,31 +1356,43 @@ describe("editing done: GIS tells LAIS the work is ready for the registrar", () 
     });
   });
 
-  test("the record named by the editor is used when it is not named after the version", async () => {
-    subdivideInVersion({ recordName: "Remera split 2026-11" });
-    let r = await done();
-    assert.equal(r.status, 422);
-    assert.match(r.body.error.message, /No Parcel Fabric record named "SUBV-LAIS-SUB-2026-00125-20261124"/);
-    r = await done(valid.Transaction_ID, { recordName: "remera SPLIT 2026-11" });
+  test("only the transactionId: the work is read from the version whatever record the editor used; record_name is the version's name", async () => {
+    subdivideInVersion({ recordName: "Rwaza_Nturo_Rugogwe" });
+    // An old shared record: it also created a current parcel far away in DEFAULT, which must not be sent.
+    Object.assign(fake.plots.get(2)!, { createdbyrecord: "{REC-1}" });
+    const r = await done(valid.Transaction_ID, { recordName: "ignored" });
     assert.equal(r.status, 200, JSON.stringify(r.body));
-    assert.equal(fake.webhook.calls[0]!.body.record_name, "Remera split 2026-11");
+    const sent = fake.webhook.calls[0]!.body;
+    assert.equal(sent.record_name, RECORD, "record_name comes from the version name");
+    assert.equal(sent.version_name, VERSION);
+    assert.deepEqual(sent.proposed_parcels.map((p: any) => p.parcel_ref), ["{G-11}", "{G-12}"]);
+    assert.deepEqual(sent.parent_parcels.map((p: any) => p.UPI), ["1/02/13/02/1001"]);
+  });
+
+  test("other parcels the version changes are not sent, but the editor is warned", async () => {
+    subdivideInVersion();
+    fake.versions.find((x) => x.name === VERSION)!.saved.set(4, { size: 99 });
+    const r = await editing(`/transactions/${valid.Transaction_ID}/preview`);
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    assert.equal(r.body.proposed_parcels.length, 2);
+    assert.match(r.body.warnings.join(" "), /also changes parcel .*, which is not in the transaction/);
   });
 
   test("work that does not match the transaction is refused with what to fix, and nothing is sent", async () => {
     let r = await done();
-    assert.equal(r.status, 422, "no record yet");
+    assert.equal(r.status, 422, "no work in the version yet");
     assert.equal(r.body.error.code, "not_ready");
     assert.ok(r.body.error.details.problems.length);
 
     subdivideInVersion({ parcels: [11] });
     r = await done();
-    assert.match(r.body.error.message, /at least 2 parcels; the record .* has 1/);
+    assert.match(r.body.error.message, /at least 2 parcels; the version has 1 new parcel/);
 
     await startOver();
     subdivideInVersion({ retire: 4 });
     r = await done();
     assert.equal(r.status, 422);
-    assert.match(r.body.error.message, /1\/02\/13\/02\/1001 is not replaced by the record/);
+    assert.match(r.body.error.message, /parcel 1\/02\/13\/02\/1001 is not replaced in the version/);
     assert.equal(fake.webhook.calls.length, 0);
   });
 
@@ -1571,7 +1635,7 @@ describe("registrar's decision (LAIS → GIS): approve assigns UPIs and posts; r
   test("UPIs planned by an approval that failed stay reserved: another approval in the cell skips them, the retry gets them", async () => {
     assert.equal((await submit(second)).status, 201);
     subdivide();
-    subdivide(second, 8, [13, 14], "{REC-2}");
+    subdivide(second, 8, [15, 16], "{REC-2}");
     const [a, b] = [await sendDone(), await sendDone(second)];
     fake.reconcileConflict = true;
     assert.deepEqual(codes((await decide("approve", { event_id: a, approved_by: "r" })).body), ["RECONCILE_CONFLICT"]);
@@ -1620,7 +1684,7 @@ describe("registrar's decision (LAIS → GIS): approve assigns UPIs and posts; r
   test("two approvals in the same cell at once never get the same numbers; the same approval twice at once posts once", async () => {
     assert.equal((await submit(second)).status, 201);
     subdivide();
-    subdivide(second, 8, [13, 14], "{REC-2}");
+    subdivide(second, 8, [15, 16], "{REC-2}");
     const [a, b] = [await sendDone(), await sendDone(second)];
     const [ra, rb, rc] = await Promise.all([
       decide("approve", { event_id: a, approved_by: "r" }),
@@ -1659,12 +1723,12 @@ describe("registrar's decision (LAIS → GIS): approve assigns UPIs and posts; r
 });
 
 describe("subdivision completion webhook: reconciler (GIS → outbox) and delivery to App B", () => {
-  type OutboxMod = typeof import("../src/webhooks/outbox.js");
+  type OutboxMod = typeof import("../src/modules/webhooks/domain/outbox.js");
   let FileOutbox: OutboxMod["FileOutbox"];
-  let reconcile: typeof import("../src/webhooks/subdivisionCompletion.js").reconcileSubdivisions;
-  let dispatchDue: typeof import("../src/webhooks/dispatcher.js").dispatchDue;
-  let signing: typeof import("../src/webhooks/signing.js");
-  let withToken: typeof import("../src/lais/arcgisClient.js").withServiceToken;
+  let reconcile: typeof import("../src/modules/webhooks/domain/subdivision-completion.js").reconcileSubdivisions;
+  let dispatchDue: typeof import("../src/modules/webhooks/domain/dispatcher.js").dispatchDue;
+  let signing: typeof import("../src/modules/webhooks/domain/signing.js");
+  let withToken: typeof import("../src/common/arcgis/arcgis-client.js").withServiceToken;
   const APP_B_SECRET = "app-b-shared-secret-0123456789abcdef";
   const PLACE = { province: "Kigali City", district: "Gasabo", sector: "Remera", cell: "Nyarutarama", village: "Kamahwa" };
   const EDITED = Date.parse("2026-11-27T09:15:00Z");
@@ -1682,11 +1746,11 @@ describe("subdivision completion webhook: reconciler (GIS → outbox) and delive
   const run = (now = Date.now()) => reconcile(box, withToken, now);
 
   before(async () => {
-    ({ FileOutbox } = await import("../src/webhooks/outbox.js"));
-    ({ reconcileSubdivisions: reconcile } = await import("../src/webhooks/subdivisionCompletion.js"));
-    ({ dispatchDue } = await import("../src/webhooks/dispatcher.js"));
-    signing = await import("../src/webhooks/signing.js");
-    ({ withServiceToken: withToken } = await import("../src/lais/arcgisClient.js"));
+    ({ FileOutbox } = await import("../src/modules/webhooks/domain/outbox.js"));
+    ({ reconcileSubdivisions: reconcile } = await import("../src/modules/webhooks/domain/subdivision-completion.js"));
+    ({ dispatchDue } = await import("../src/modules/webhooks/domain/dispatcher.js"));
+    signing = await import("../src/modules/webhooks/domain/signing.js");
+    ({ withServiceToken: withToken } = await import("../src/common/arcgis/arcgis-client.js"));
   });
   beforeEach(async () => {
     cfg.LAIS_WRITE_MODE = "version-only";
@@ -1848,7 +1912,7 @@ describe("subdivision completion webhook: reconciler (GIS → outbox) and delive
   });
 
   test("administration API: administrators only; lists events and waiting results; replays only dead letters", async () => {
-    const { subdivisionOutbox } = await import("../src/webhooks/worker.js");
+    const { subdivisionOutbox } = await import("../src/modules/webhooks/domain/worker.js");
     box = subdivisionOutbox(); // the outbox the API serves
     await box.trackingSince(Date.now() - 60_000);
     const admin = base.replace(/\/lais$/, "/webhooks/subdivision");

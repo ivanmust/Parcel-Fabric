@@ -19,7 +19,7 @@
 import { createServer, type ServerResponse } from "node:http";
 import { appendFile, mkdir } from "node:fs/promises";
 import path from "node:path";
-import { verifySignature } from "../webhooks/signing.js";
+import { verifySignature } from "../modules/webhooks/domain/signing.js";
 
 const port = Number(process.env.MOCK_APP_B_PORT ?? 4011);
 const secrets = [process.env.MOCK_APP_B_SECRET ?? "mock-app-b-shared-secret-0123456789abcdef", process.env.MOCK_APP_B_SECRET_PREVIOUS ?? ""].filter(Boolean);

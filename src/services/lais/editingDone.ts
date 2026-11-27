@@ -1,4 +1,4 @@
-import { apiFetch } from "../api/apiClient";
+import { ApiError, apiFetch } from "../api/apiClient";
 
 /** The GIS → LAIS "editing done" notification (server: /api/lais-editing). */
 
@@ -68,13 +68,23 @@ export interface EditingDonePreview {
 export const listLaisTransactions = () =>
   apiFetch<{ enabled: boolean; configured: boolean; transactions: LaisTransactionSummary[] }>("/lais-editing/transactions");
 
-export const previewEditingDone = (transactionId: string, recordName?: string) =>
-  apiFetch<EditingDonePreview>(`/lais-editing/transactions/${encodeURIComponent(transactionId)}/preview${recordName ? `?recordName=${encodeURIComponent(recordName)}` : ""}`);
+type Notification = NonNullable<EditingDonePreview["payload"]> & { event_id: string | null; sent_at: string | null; warnings: string[] };
 
-export const sendEditingDone = (transactionId: string, recordName?: string) =>
+/** The notification LAIS would receive. Unfinished work answers 422 not_ready with the problems to fix. */
+export async function previewEditingDone(transactionId: string): Promise<EditingDonePreview> {
+  try {
+    const { warnings, ...payload } = await apiFetch<Notification>(`/lais-editing/transactions/${encodeURIComponent(transactionId)}/preview`);
+    return { payload, problems: [], warnings };
+  } catch (error) {
+    if (!(error instanceof ApiError) || error.code !== "not_ready") throw error;
+    const details = (error.details ?? {}) as { problems?: string[]; warnings?: string[] };
+    return { payload: null, problems: details.problems ?? [error.message], warnings: details.warnings ?? [] };
+  }
+}
+
+export const sendEditingDone = (transactionId: string) =>
   apiFetch<{ editing_done: EditingDoneView; warnings: string[] }>(`/lais-editing/transactions/${encodeURIComponent(transactionId)}/editing-done`, {
     method: "POST",
-    json: recordName ? { recordName } : {},
   });
 
 /** How a notification's state, and the registrar's decision on it, read to an editor. */

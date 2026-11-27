@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { configWarnings } from "../src/config/configWarnings.js";
+import { configWarnings } from "../src/config/config-warnings.js";
 
 const base = {
   NODE_ENV: "production" as const,

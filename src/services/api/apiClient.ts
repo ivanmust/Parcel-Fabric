@@ -12,6 +12,7 @@ export class ApiError extends Error {
     message: string,
     public readonly code: string,
     public readonly requestId?: string,
+    public readonly details?: unknown,
   ) {
     super(message);
     this.name = "ApiError";
@@ -38,8 +39,8 @@ export async function apiFetch<T>(path: string, init: RequestInit & { json?: unk
   if (res.status === 204) return undefined as T;
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    const e = (data as { error?: { message?: string; code?: string; requestId?: string } }).error;
-    throw new ApiError(res.status, e?.message ?? `Request failed (${res.status})`, e?.code ?? "http_error", e?.requestId);
+    const e = (data as { error?: { message?: string; code?: string; requestId?: string; details?: unknown } }).error;
+    throw new ApiError(res.status, e?.message ?? `Request failed (${res.status})`, e?.code ?? "http_error", e?.requestId, e?.details);
   }
   return data as T;
 }

@@ -10,7 +10,7 @@ import path from "node:path";
 const auditDir = mkdtempSync(path.join(tmpdir(), "audit-read-"));
 process.env.AUDIT_DIR = auditDir;
 
-type Read = typeof import("../src/audit/auditLog.js").readAudit;
+type Read = typeof import("../src/common/audit/audit-log.js").readAudit;
 let readAudit: Read;
 
 const event = (id: string, time: string, username: string, action: string, outcome = "success", extra: Record<string, unknown> = {}) =>
@@ -32,7 +32,7 @@ before(async () => {
       event("n4", "2026-11-26T10:00:00.000Z", "editor.two", "edit-session.save"),
     ].join("\n") + "\n",
   );
-  readAudit = (await import("../src/audit/auditLog.js")).readAudit;
+  readAudit = (await import("../src/common/audit/audit-log.js")).readAudit;
 });
 
 const ids = (page: { events: Array<{ id: string }> }) => page.events.map((e) => e.id);

@@ -19,7 +19,7 @@ LAIS ──POST /api/lais/transactions (X-API-Key)──► GIS Integration API
 GIS editors ── Version Manager ▸ LAIS transactions ── open version ▸ review ▸ reconcile/post
 ```
 
-Code: [server/src/lais/laisService.ts](../server/src/lais/laisService.ts) (workflow), [server/src/lais/arcgisClient.ts](../server/src/lais/arcgisClient.ts) (token + Referer), [server/src/routes/lais.ts](../server/src/routes/lais.ts) (HTTP), tests in [server/test/lais.test.ts](../server/test/lais.test.ts) (`npm test` in `server/`, fake ArcGIS, no network).
+Code: [server/src/modules/lais/](../server/src/modules/lais/) (domain: submit, status, completion; repositories: Plot layer, versions, ledger), [arcgis-client.ts](../server/src/common/arcgis/arcgis-client.ts) (token + Referer), [lais-transactions.controller.ts](../server/src/modules/lais/controllers/lais-transactions.controller.ts) (HTTP), tests in [server/test/lais.test.ts](../server/test/lais.test.ts) (`npm test` in `server/`, fake ArcGIS, no network).
 
 ## Parcels per transaction
 
@@ -77,7 +77,7 @@ The approval flow agreed with LAIS on 2026-11-26:
 
 **Switch:** `LAIS_EDITING_DONE=false` by default. Keep it off until steps 2 and 3 both work end to end. With it on, Reconcile & post is not offered for LAIS versions (they are posted at approval), and the editors' Assign UPIs step moves to approval.
 
-**Settings:** `LAIS_WEBHOOK_URL` (LAIS's endpoint) and `LAIS_WEBHOOK_KEY` (the key LAIS issued to GIS, sent as `X-API-Key`), `LAIS_WEBHOOK_TIMEOUT_MS` (default 10 s). For local testing, `npm run mock-lais` in `server/` starts a stand-in LAIS endpoint on port 4010 (`MOCK_LAIS_MODE=ok|fail-once|refuse|slow`); it writes what it receives to `server/data/mock-lais/received.jsonl`.
+**Settings:** `LAIS_WEBHOOK_URL` (LAIS's endpoint, e.g. `http://192.168.160.188:8000/transaction/processed`), `LAIS_WEBHOOK_KEY` (the key LAIS issued to GIS, sent as `X-API-Key`), `LAIS_WEBHOOK_METHOD` (`PUT` as LAIS asked, default; or `POST`), `LAIS_WEBHOOK_TIMEOUT_MS` (default 10 s). For local testing, `npm run mock-lais` in `server/` starts a stand-in LAIS endpoint on port 4010 (`MOCK_LAIS_MODE=ok|fail-once|refuse|slow`); it writes what it receives to `server/data/mock-lais/received.jsonl`.
 
 **What GIS sends** (`POST`, JSON, headers `X-API-Key`, `X-GIS-Event-Id`, `X-GIS-Event-Type: editing.completed`), exactly the sample sent to LAIS:
 `event_id`, `event_type`, `sent_at`, `Transaction_ID`, `Transaction_Type`, `version_name`, `record_name`, `edited_by`, `parent_parcels[]` (`UPI`, `area_sqm`, `province` … `village`), `proposed_parcels[]` (`parcel_ref` = the Plot's global id, `UPI` null for new parcels, `area_sqm`, location, `geometry` as GeoJSON in EPSG:4326), `totals`.
@@ -88,7 +88,7 @@ The approval flow agreed with LAIS on 2026-11-26:
 
 **Location on new parcels:** Divide and Merge do not copy province … village to the new parcels, and Assign UPIs (which used to fill them) moves to approval. The web app now copies the parents' location onto the new parcels right after a Divide or Merge, for each field on which all parents agree.
 
-Code: [server/src/lais/editingDone.ts](../server/src/lais/editingDone.ts), [server/src/routes/laisEditing.ts](../server/src/routes/laisEditing.ts) (`/api/lais-editing`, signed-in editors), [src/components/dialogs/EditingDoneDialog.tsx](../src/components/dialogs/EditingDoneDialog.tsx).
+Code: [editing-done.ts](../server/src/modules/lais/domain/editing-done.ts), [lais-editing.controller.ts](../server/src/modules/lais/controllers/lais-editing.controller.ts) (`/api/lais-editing`, signed-in editors or the API key), [src/components/dialogs/EditingDoneDialog.tsx](../src/components/dialogs/EditingDoneDialog.tsx).
 
 ## Plot layer fields written (inside the version, `attributes` mode only)
 
@@ -103,7 +103,7 @@ Code: [server/src/lais/editingDone.ts](../server/src/lais/editingDone.ts), [serv
 | `version_status` | `VersionCreated` |
 | `version_name` | fully qualified version name, e.g. `svc_lais.SUBV-LAIS-SUB-2026-00125-20261124` |
 
-Version name = `{TYPE}-{CASE_NUMBER}-{DATE}`: TYPE `SUBV` Subdivision · `MERG` Merge · `CORB` CorrectBoundaries · `CRPL` CreatePlot; CASE_NUMBER = `Transaction_ID` (characters other than letters, digits, `-`, `_` become `-`); DATE = `yyyyMMdd` of `Transaction_Date` as sent; at most 62 characters. Two different Transaction_IDs that map to the same name are refused with 409 rather than sharing a version. Codes live in `TYPE_CODES` in `server/src/lais/laisService.ts` (the editor dialog's filter in `LaisTransactionsDialog.tsx` must match).
+Version name = `{TYPE}-{CASE_NUMBER}-{DATE}`: TYPE `SUBV` Subdivision · `MERG` Merge · `CORB` CorrectBoundaries · `CRPL` CreatePlot; CASE_NUMBER = `Transaction_ID` (characters other than letters, digits, `-`, `_` become `-`); DATE = `yyyyMMdd` of `Transaction_Date` as sent; at most 62 characters. Two different Transaction_IDs that map to the same name are refused with 409 rather than sharing a version. Codes live in `TYPE_CODES` in `server/src/modules/lais/domain/version-naming.ts` (the editor dialog's filter in `LaisTransactionsDialog.tsx` must match).
 
 Field names are resolved case-insensitively from the live layer metadata; the API refuses to run (503) if the layer is not branch versioned, a field is missing, or the `case_`/`version_status` domains lack `Yes`/`VersionCreated`.
 

@@ -19,7 +19,6 @@ import {
 export function EditingDoneDialog({ transaction, onClose, onSent }: { transaction: LaisTransactionSummary | null; onClose: () => void; onSent: () => void }) {
   const current = useEditing((s) => s.current);
   const pending = useEditing((s) => s.pendingEdits);
-  const activeRecord = useEditing((s) => s.activeRecord);
   const notify = useApp((s) => s.notify);
   const [preview, setPreview] = useState<EditingDonePreview | null>(null);
   const [loading, setLoading] = useState(false);
@@ -29,14 +28,13 @@ export function EditingDoneDialog({ transaction, onClose, onSent }: { transactio
 
   const open = !!transaction;
   const onVersion = !!transaction && current?.name === transaction.version_name;
-  const recordName = activeRecord?.name;
 
   const load = async () => {
     if (!transaction) return;
     setLoading(true);
     setError(null);
     try {
-      setPreview(await previewEditingDone(transaction.Transaction_ID, recordName));
+      setPreview(await previewEditingDone(transaction.Transaction_ID));
     } catch (e) {
       setPreview(null);
       setError((e as Error).message);
@@ -57,7 +55,7 @@ export function EditingDoneDialog({ transaction, onClose, onSent }: { transactio
     setSending(true);
     setError(null);
     try {
-      const r = await sendEditingDone(transaction.Transaction_ID, recordName);
+      const r = await sendEditingDone(transaction.Transaction_ID);
       setResult(r.editing_done);
       const s = describeStatus(r.editing_done);
       notify(s.tone === "ok" ? "success" : s.tone === "bad" ? "danger" : "warning", s.label, transaction.Transaction_ID);

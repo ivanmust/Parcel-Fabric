@@ -55,7 +55,7 @@ Live end-to-end tests (they need both dev servers and work only in throw-away ve
 
 ## API documentation
 
-The backend API is described in [server/openapi.yaml](server/openapi.yaml) (OpenAPI 3.1). With the dev servers running, browse it in Swagger UI at http://localhost:5174/api/docs (or http://localhost:4001/api/docs). **Authorize** takes a Portal token to try the protected endpoints. The docs are on by default except in production; set `API_DOCS=true` or `false` in `server/.env` to override. Keep the file in step with `server/src/routes/` when routes change.
+The API is a NestJS app; its OpenAPI description is generated from the controllers and DTOs, so it always matches the code. With the dev servers running, browse it in Swagger UI at http://localhost:5174/api/docs (or http://localhost:4001/api/docs); the spec is at `/api/openapi.json` and `/api/openapi.yaml`. **Authorize** takes the API key (`X-API-Key`, the `LAIS_API_KEY` in `server/.env`), which does not expire and opens every endpoint, or a Portal token. The docs are on by default except in production; set `API_DOCS=true` or `false` in `server/.env` to override.
 
 ## Project layout
 
@@ -65,7 +65,7 @@ The backend API is described in [server/openapi.yaml](server/openapi.yaml) (Open
 | `src/gis/` | GIS logic without React: map controller, layers, editing, Parcel Fabric records, search, selection, version management |
 | `src/services/` | API client, Portal sign-in, ArcGIS helpers, audit, error reporting |
 | `src/stores/` | App state (Zustand) |
-| `server/src/` | API: config, token validation, roles, audit log, bookmarks |
+| `server/src/` | NestJS API: `common/` (auth guard, errors, ArcGIS client, audit log), `config/`, `modules/<feature>/` (controllers, services, dto, models, repositories, domain) |
 | `tests/e2e/` | Live end-to-end tests |
 
 ## Security model

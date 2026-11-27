@@ -16,11 +16,11 @@ const dir = mkdtempSync(path.join(tmpdir(), "webhook-"));
 process.env.AUDIT_DIR = path.join(dir, "audit");
 process.env.LOG_LEVEL = "fatal";
 
-type Signing = typeof import("../src/webhooks/signing.js");
-type Backoff = typeof import("../src/webhooks/backoff.js");
-type Outbox = typeof import("../src/webhooks/outbox.js");
-type Dispatcher = typeof import("../src/webhooks/dispatcher.js");
-type Lock = typeof import("../src/webhooks/workerLock.js");
+type Signing = typeof import("../src/modules/webhooks/domain/signing.js");
+type Backoff = typeof import("../src/modules/webhooks/domain/backoff.js");
+type Outbox = typeof import("../src/modules/webhooks/domain/outbox.js");
+type Dispatcher = typeof import("../src/modules/webhooks/domain/dispatcher.js");
+type Lock = typeof import("../src/modules/webhooks/domain/worker-lock.js");
 let signing: Signing, backoff: Backoff, outboxMod: Outbox, dispatcher: Dispatcher, lock: Lock;
 
 const SECRET = "s".repeat(32) + "-current";
@@ -36,11 +36,11 @@ const receiver = {
 let server: Server;
 let url = "";
 before(async () => {
-  signing = await import("../src/webhooks/signing.js");
-  backoff = await import("../src/webhooks/backoff.js");
-  outboxMod = await import("../src/webhooks/outbox.js");
-  dispatcher = await import("../src/webhooks/dispatcher.js");
-  lock = await import("../src/webhooks/workerLock.js");
+  signing = await import("../src/modules/webhooks/domain/signing.js");
+  backoff = await import("../src/modules/webhooks/domain/backoff.js");
+  outboxMod = await import("../src/modules/webhooks/domain/outbox.js");
+  dispatcher = await import("../src/modules/webhooks/domain/dispatcher.js");
+  lock = await import("../src/modules/webhooks/domain/worker-lock.js");
   server = createServer((req, res) => {
     let body = "";
     req.on("data", (c) => (body += c));
@@ -63,7 +63,7 @@ after(() => {
 
 let n = 0;
 const freshFile = () => path.join(dir, `outbox-${++n}`, "outbox.json");
-const cfg = (over: Partial<import("../src/webhooks/dispatcher.js").DispatchConfig> = {}) => ({
+const cfg = (over: Partial<import("../src/modules/webhooks/domain/dispatcher.js").DispatchConfig> = {}) => ({
   url,
   secrets: [SECRET],
   timeoutMs: 1500,
@@ -293,7 +293,7 @@ describe("dispatcher", () => {
 // ------------------------------------------------------------------ configuration
 describe("configuration validation", () => {
   const load = (env: Record<string, string>) =>
-    spawnSync(process.execPath, ["--import", "tsx", "-e", "await import('./src/config/env.ts'); console.log('loaded')"], {
+    spawnSync(process.execPath, ["--import", "@swc-node/register/esm-register", "-e", "await import('./src/config/env.ts'); console.log('loaded')"], {
       cwd: path.resolve(import.meta.dirname, ".."),
       env: { ...process.env, ...env },
       encoding: "utf8",

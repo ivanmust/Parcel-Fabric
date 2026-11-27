@@ -7,7 +7,7 @@ function Section($title) { Write-Host "`n=== $title ===" -ForegroundColor Cyan }
 
 Section "0. Paths"
 "AppDir = $AppDir"
-"server\dist\index.js exists = $(Test-Path (Join-Path $server 'dist\index.js'))"
+"server\dist\main.js exists  = $(Test-Path (Join-Path $server 'dist\main.js'))"
 "dist\index.html exists      = $(Test-Path (Join-Path $AppDir 'dist\index.html'))"
 "server\.env exists          = $(Test-Path (Join-Path $server '.env'))"
 "node version                = $(try { node --version } catch { 'NODE NOT FOUND' })"

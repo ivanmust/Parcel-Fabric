@@ -4,29 +4,36 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "tsx watch --env-file-if-exists=.env src/index.ts",
-    "start": "node --env-file-if-exists=.env dist/index.js",
+    "dev": "node --import @swc-node/register/esm-register --watch --env-file-if-exists=.env src/main.ts",
+    "start": "node --env-file-if-exists=.env dist/main.js",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --import tsx --test test/*.test.ts",
-    "inspect-services": "tsx --env-file-if-exists=.env src/scripts/inspectServices.ts",
-    "mock-lais": "tsx src/scripts/mockLaisWebhook.ts",
-    "mock-app-b": "tsx src/scripts/mockAppB.ts"
+    "test": "node --import @swc-node/register/esm-register --test test/*.test.ts",
+    "inspect-services": "node --import @swc-node/register/esm-register --env-file-if-exists=.env src/scripts/inspectServices.ts",
+    "mock-lais": "node --import @swc-node/register/esm-register src/scripts/mockLaisWebhook.ts",
+    "mock-app-b": "node --import @swc-node/register/esm-register src/scripts/mockAppB.ts"
   },
   "dependencies": {
+    "@nestjs/common": "12.5.0",
+    "@nestjs/core": "12.5.0",
+    "@nestjs/platform-express": "12.5.0",
+    "@nestjs/swagger": "12.1.1",
     "express": "5.1.0",
     "express-rate-limit": "8.7.5",
     "helmet": "8.1.0",
     "pino": "10.1.0",
     "pino-http": "11.0.0",
+    "reflect-metadata": "0.2.2",
+    "rxjs": "7.8.2",
     "swagger-ui-dist": "5.34.1",
     "zod": "4.6.6"
   },
   "devDependencies": {
+    "@swc-node/register": "1.12.1",
+    "@swc/core": "1.16.22",
     "@types/express": "5.0.5",
     "@types/node": "24.10.0",
     "pino-pretty": "13.1.2",
-    "tsx": "4.20.6",
     "typescript": "5.9.3"
   },
   "scarfSettings": {
