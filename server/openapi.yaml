@@ -44,6 +44,8 @@ tags:
     description: LAIS transaction intake (server-to-server, X-API-Key)
   - name: LAIS editing
     description: GIS editors send a LAIS transaction's finished work to LAIS for the registrar's approval (switch LAIS_EDITING_DONE)
+  - name: App B webhook (admin)
+    description: Subdivision completion webhook to App B (administrators); contract in docs/SUBDIVISION-WEBHOOK.md and the Webhooks section
   - name: Diagnostics
     description: Browser error reporting
 
@@ -374,6 +376,57 @@ paths:
         "502": { $ref: "#/components/responses/LaisFailure" }
         "503": { $ref: "#/components/responses/LaisFailure" }
 
+  /lais/transactions/{transactionId}/changes:
+    get:
+      tags: [LAIS]
+      operationId: getLaisTransactionChanges
+      summary: Review what the transaction's GIS version changed, compared with the official data
+      description: |
+        Read with ArcGIS VersionManagementServer `differences` (the version vs sde.DEFAULT). Read-only.
+        `summary` counts inserts/updates/deletes per layer; `plots` lists the Plots added, changed (with
+        `changed_fields` before/after and `shape_changed`) and deleted; `records` the Parcel Fabric records
+        changed. `checks` and `warnings` say when the work does not match the transaction: the parcels LAIS
+        sent are not changed, other parcels are changed, the record is not named after the version, or a new
+        UPI is already used in the official data. 409 VERSION_IN_USE while an editor is editing the version;
+        409 VERSION_GONE once it was posted or deleted.
+      security:
+        - laisApiKey: []
+      parameters:
+        - { name: transactionId, in: path, required: true, schema: { type: string } }
+        - { name: geometry, in: query, required: false, description: "true = GeoJSON (WGS 84) for each Plot", schema: { type: boolean, default: false } }
+      responses:
+        "200":
+          description: The changes
+          content:
+            application/json:
+              example:
+                success: true
+                message: "Changes read; see warnings."
+                data:
+                  Transaction_ID: LAIS-SUB-2026-00125
+                  Transaction_Type: Subdivision
+                  UPIs: ["1/02/13/02/1001"]
+                  version_name: qt_testing.SUBV-LAIS-SUB-2026-00125-20261124
+                  compared_with: sde.DEFAULT
+                  summary:
+                    - { layer_id: 16, layer_name: Plot_Lines, inserts: 1, updates: 1, deletes: 0 }
+                    - { layer_id: 17, layer_name: Plot, inserts: 2, updates: 1, deletes: 0 }
+                  plots:
+                    inserted:
+                      - { object_id: 95476, global_id: "{…}", UPI: "1/02/13/02/3875", retired: false, record: Remera_Nyarutarama_Kamahwa_2026-11-18, attributes: { "…": every Plot field } }
+                    updated:
+                      - { object_id: 1413, global_id: "{…}", UPI: "1/02/13/02/619", retired: true, record: Remera_Nyarutarama_Kamahwa_2026-11-18, shape_changed: false, changed_fields: { retiredbyrecord: { before: null, after: "{34F8B17D-…}" } }, attributes: { "…": every Plot field } }
+                    deleted: []
+                  records:
+                    - { change: updated, global_id: "{34F8B17D-…}", name: Remera_Nyarutarama_Kamahwa_2026-11-18 }
+                  checks: { transaction_parcels_unchanged: ["1/02/13/02/1001"], other_parcels_changed: ["1/02/13/02/619"] }
+                  warnings:
+                    - "The version does not change the transaction's parcel 1/02/13/02/1001 (sent by LAIS)."
+                    - "The version also changes a parcel that is not in the transaction: 1/02/13/02/619."
+        "401": { $ref: "#/components/responses/LaisFailure" }
+        "404": { $ref: "#/components/responses/LaisFailure" }
+        "409": { $ref: "#/components/responses/LaisFailure" }
+        "502": { $ref: "#/components/responses/LaisFailure" }
   /lais/transactions/{transactionId}/approve:
     post:
       tags: [LAIS]
@@ -555,11 +608,32 @@ paths:
                   transactions: { type: array, items: { type: object } }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
+  /lais-editing/transactions/{transactionId}/changes:
+    get:
+      tags: [LAIS editing]
+      operationId: getEditingChanges
+      summary: Review what the transaction's version changed (same data as GET /lais/transactions/{id}/changes)
+      description: For the GIS editor before pressing Editing done. Read-only (ArcGIS differences, version vs sde.DEFAULT).
+      parameters:
+        - { name: transactionId, in: path, required: true, schema: { type: string } }
+        - { name: geometry, in: query, required: false, schema: { type: boolean, default: false } }
+      responses:
+        "200": { description: "The changes: summary, plots, records, checks, warnings" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: Unknown transaction }
+        "409": { description: "version_in_use (an editor is editing it) or version_gone" }
   /lais-editing/transactions/{transactionId}/preview:
     get:
       tags: [LAIS editing]
       operationId: previewEditingDone
       summary: What would be sent to LAIS, with problems to fix first (sends nothing)
+      description: >-
+        Signed-in editors (Portal token) or API clients with the LAIS API key (X-API-Key, does not expire).
+        When an X-API-Key header is sent it must be valid; the Portal token is then not checked.
+      security:
+        - laisApiKey: []
+        - bearerAuth: []
       parameters:
         - { name: transactionId, in: path, required: true, schema: { type: string } }
         - { name: recordName, in: query, required: false, description: "The record to use when it is not named after the version (the editor's active record)", schema: { type: string, maxLength: 255 } }
@@ -583,7 +657,9 @@ paths:
       summary: The editor has finished; send the work to LAIS
       description: |
         Builds the notification from the transaction's version and posts it to LAIS_WEBHOOK_URL with
-        X-API-Key. 200 when LAIS answered 2xx; 202 when it is retrying (408/429/5xx/timeout) or LAIS
+        X-API-Key. Also writes the Plot field editing_status = "Edits done" on the new parcels, in the
+        version. (Editors who finish in ArcGIS Pro can set that field instead: GIS checks open LAIS
+        versions every LAIS_EDITS_DONE_SCAN_MS and sends this notification itself.) 200 when LAIS answered 2xx; 202 when it is retrying (408/429/5xx/timeout) or LAIS
         refused it (other 4xx: see last_message). 409 already_sent, version_gone or already_posted;
         422 not_ready (error.details.problems); 503 feature_disabled or not_configured.
       parameters:
@@ -602,6 +678,141 @@ paths:
         "202": { description: Not delivered yet (retrying) or refused by LAIS }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
+
+  /webhooks/subdivision/events:
+    get:
+      tags: [App B webhook (admin)]
+      operationId: listSubdivisionWebhookEvents
+      summary: Subdivision completion events in the outbox (newest first)
+      description: Requires admin:audit. Shows payloads, delivery state and attempt history; never signing keys.
+      parameters:
+        - { name: status, in: query, required: false, schema: { type: string, enum: [pending, delivering, delivered, dead] } }
+      responses:
+        "200": { description: "enabled, events" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /webhooks/subdivision/waiting:
+    get:
+      tags: [App B webhook (admin)]
+      operationId: listSubdivisionWebhookWaiting
+      summary: Posted subdivisions whose event waits for complete data (e.g. a missing UPI)
+      responses:
+        "200": { description: "waiting: key, since, lastCheckedAt, checks, reason" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /webhooks/subdivision/events/{eventId}/replay:
+    post:
+      tags: [App B webhook (admin)]
+      operationId: replaySubdivisionWebhookEvent
+      summary: Queue a dead-lettered event again (after fixing the cause)
+      parameters:
+        - { name: eventId, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: The event, pending again }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { description: The event is not dead-lettered }
+
+webhooks:
+  subdivisionCompleted:
+    post:
+      operationId: appBSubdivisionCompleted
+      # GIS authenticates to App B with the HMAC signature headers below, not with a Portal token.
+      security: []
+      summary: "GIS → App B: a Subdivision was posted in ArcGIS (event subdivision.completed, contract 1.0)"
+      description: |
+        **Implemented by App B, called by GIS** when a Subdivision transaction goes InReview → Posted
+        (server settings `SUBDIVISION_WEBHOOK_URL`, `SUBDIVISION_WEBHOOK_SECRET`). Full contract and a
+        verification example: docs/SUBDIVISION-WEBHOOK.md.
+
+        - Verify `X-Webhook-Signature` = `v1=` + hex HMAC-SHA256(secret, `X-Webhook-Timestamp` + "." + raw body);
+          reject when the timestamp is more than 5 minutes off (answer 401).
+        - `event_id` is stable per transaction and repeated on every retry: store it and ignore repeats.
+        - Answer 2xx quickly. 408, 429, 5xx or a timeout are retried with exponential backoff (up to
+          `SUBDIVISION_WEBHOOK_MAX_ATTEMPTS`), then dead-lettered; other 4xx are not retried.
+      parameters:
+        - { name: X-Webhook-Id, in: header, required: true, schema: { type: string } }
+        - { name: X-Webhook-Event, in: header, required: true, schema: { type: string, const: subdivision.completed } }
+        - { name: X-Webhook-Version, in: header, required: true, schema: { type: string, const: "1.0" } }
+        - { name: X-Webhook-Timestamp, in: header, required: true, schema: { type: string, description: Unix seconds } }
+        - { name: X-Webhook-Signature, in: header, required: true, schema: { type: string, example: "v1=5d41402abc4b2a76b9719d911017c592…" } }
+        - { name: X-Webhook-Attempt, in: header, required: true, schema: { type: integer } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            example:
+              event_id: 1f0c2a8e-4b1d-5a3c-9e2f-7d6b5a4c3b2a
+              event_type: subdivision.completed
+              event_version: "1.0"
+              created_at: "2026-11-27T09:20:04.512Z"
+              data:
+                Transaction_ID: LAIS-SUB-2026-00125
+                Transaction_Type: Subdivision
+                Transaction_Date: "2026-11-24T08:30:00+02:00"
+                Transaction_Status: null
+                version_name: qt_testing.SUBV-LAIS-SUB-2026-00125-20261124
+                completed_at: "2026-11-27T09:15:00.000Z"
+                detected_at: "2026-11-27T09:20:03.117Z"
+                detected_via: record
+                records:
+                  - { global_id: "{7F242D4F-E063-4644-A898-D06B366D53B4}", name: SUBV-LAIS-SUB-2026-00125-20261124, recorded_date: "2026-11-27T00:00:00.000Z" }
+                original_parcel: { UPI: "1/02/13/02/1001", object_id: 3289, global_id: "{10A2731D-D912-42B9-9EA2-1BF02F5A912D}", current: false, area_sqm: 1570.96, attributes: { "…": every Plot field } }
+                resulting_parcels:
+                  - { UPI: "1/02/13/02/1101", object_id: 8030, global_id: "{B48C7050-494C-4538-B8E7-569376E8D956}", current: true, area_sqm: 785.48, attributes: { "…": every Plot field }, geometry: { type: Polygon, coordinates: [[[30.1000455, -1.9497315], [30.1001, -1.9497315], [30.1001, -1.9498], [30.1000455, -1.9497315]]] } }
+      responses:
+        "200": { description: "Any 2xx: App B received it" }
+        "4XX": { description: "408 and 429 are retried; any other 4xx is permanent (not retried)" }
+        "5XX": { description: Retried with exponential backoff, then dead-lettered }
+
+  editingCompleted:
+    post:
+      operationId: laisEditingCompleted
+      # GIS authenticates to LAIS with the X-API-Key header below, not with a Portal token.
+      security: []
+      summary: "GIS → LAIS: the GIS editor has finished a transaction (event editing.completed)"
+      description: |
+        **Implemented by LAIS, called by GIS.** When the GIS editor presses "Editing done" (or marks the new
+        parcels editing_status = "Edits done", e.g. in ArcGIS Pro), GIS POSTs this
+        to the URL LAIS gave (server setting `LAIS_WEBHOOK_URL`) with the key LAIS gave (`LAIS_WEBHOOK_KEY`)
+        in `X-API-Key`. The registrar then reviews it in LAIS and LAIS calls
+        `POST /lais/transactions/{Transaction_ID}/approve` with this `event_id` (or `/reject`).
+
+        - New parcels have **no UPI yet** (`UPI: null`): GIS creates the UPIs at approval. Each new parcel
+          has `parcel_ref` (its GIS global id); the approve response gives its UPI by `parcel_ref`.
+        - Geometry is GeoJSON in WGS 84 (EPSG:4326); areas in m².
+        - **Answer any 2xx** when received. 408, 429, 5xx, a timeout (10 s) or no connection: GIS retries the
+          **same `event_id`** after about 1, 5 and 15 minutes, then hourly, for 24 hours, so treat a repeated
+          `event_id` as already received. Any other 4xx: GIS stops and shows LAIS's `message` to the editor.
+        - Revised work after a rejection comes with a **new** `event_id`; decide on the latest one.
+      parameters:
+        - { name: X-API-Key, in: header, required: true, description: The key LAIS issued to GIS, schema: { type: string } }
+        - { name: X-GIS-Event-Id, in: header, required: true, description: Same as event_id in the body, schema: { type: string, format: uuid } }
+        - { name: X-GIS-Event-Type, in: header, required: true, schema: { type: string, const: editing.completed } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/LaisEditingCompleted" }
+            example:
+              event_id: 8b1189be-3a87-4dbe-bf83-abf4e7d50c20
+              event_type: editing.completed
+              sent_at: "2026-11-26T22:51:05.388Z"
+              Transaction_ID: TRN14885852
+              Transaction_Type: Subdivision
+              version_name: qt_testing.SUBV-TRN14885852-20261127
+              record_name: SUBV-TRN14885852-20261127
+              edited_by: gisa@esri_rw
+              parent_parcels:
+                - { UPI: "1/02/13/02/2679", area_sqm: 1089.91, province: Kigali City, district: Gasabo, sector: Remera, cell: Nyarutarama, village: Kamahwa }
+              proposed_parcels:
+                - { parcel_ref: "{E5605F4D-5F1C-4E45-BFBA-761E6DB28744}", UPI: null, area_sqm: 544.95, province: Kigali City, district: Gasabo, sector: Remera, cell: Nyarutarama, village: Kamahwa, geometry: { type: Polygon, coordinates: [[[30.1065, -1.9441], [30.1066, -1.9441], [30.1066, -1.9442], [30.1065, -1.9442], [30.1065, -1.9441]]] } }
+                - { parcel_ref: "{4A93FC85-F26A-4C3B-A5D5-87D420DC84AF}", UPI: null, area_sqm: 544.96, province: Kigali City, district: Gasabo, sector: Remera, cell: Nyarutarama, village: Kamahwa, geometry: { type: Polygon, coordinates: [[[30.1066, -1.9441], [30.1067, -1.9441], [30.1067, -1.9442], [30.1066, -1.9442], [30.1066, -1.9441]]] } }
+              totals: { parent_area_sqm: 1089.91, proposed_area_sqm: 1089.91 }
+      responses:
+        "200": { description: "Any 2xx: LAIS received it (GIS marks it delivered)" }
+        "4XX": { description: "408 and 429 are retried; any other 4xx: refused, not retried (return { message } to explain)" }
+        "5XX": { description: Retried with the same event_id for up to 24 hours }
 
 security:
   - bearerAuth: []
@@ -684,6 +895,49 @@ components:
           schema: { $ref: "#/components/schemas/Error" }
 
   schemas:
+    LaisParcel:
+      type: object
+      required: [UPI, area_sqm, province, district, sector, cell, village]
+      properties:
+        UPI: { type: [string, "null"], description: "Parent: its UPI. New parcel: null (GIS creates it at approval)" }
+        area_sqm: { type: [number, "null"], description: Area in m² (2 decimals) }
+        province: { type: [string, "null"] }
+        district: { type: [string, "null"] }
+        sector: { type: [string, "null"] }
+        cell: { type: [string, "null"] }
+        village: { type: [string, "null"] }
+    LaisEditingCompleted:
+      type: object
+      required: [event_id, event_type, sent_at, Transaction_ID, Transaction_Type, version_name, record_name, edited_by, parent_parcels, proposed_parcels, totals]
+      properties:
+        event_id: { type: string, format: uuid, description: "Unique per piece of work; repeated on retries. Send it back in approve/reject." }
+        event_type: { type: string, const: editing.completed }
+        sent_at: { type: string, format: date-time }
+        Transaction_ID: { type: string }
+        Transaction_Type: { type: string, enum: [Subdivision, Merge, CorrectBoundaries, CreatePlot] }
+        version_name: { type: string, description: "The GIS version holding the work, {TYPE}-{CASE_NUMBER}-{DATE}" }
+        record_name: { type: string, description: The Parcel Fabric record of the change }
+        edited_by: { type: string, description: The GIS editor who pressed Editing done }
+        parent_parcels:
+          type: array
+          description: The parcels being replaced (for CorrectBoundaries, the parcels as they are now in the official data)
+          items: { $ref: "#/components/schemas/LaisParcel" }
+        proposed_parcels:
+          type: array
+          description: The resulting parcels
+          items:
+            allOf:
+              - $ref: "#/components/schemas/LaisParcel"
+              - type: object
+                required: [parcel_ref, geometry]
+                properties:
+                  parcel_ref: { type: string, description: "GIS global id of the new parcel; the approve response gives its UPI by this key" }
+                  geometry: { type: [object, "null"], description: "GeoJSON Polygon or MultiPolygon, WGS 84 (EPSG:4326)" }
+        totals:
+          type: object
+          properties:
+            parent_area_sqm: { type: number }
+            proposed_area_sqm: { type: number }
     LaisTransactionRequest:
       type: object
       additionalProperties: false

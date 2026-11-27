@@ -588,8 +588,15 @@ async function createVersion(token: string, shortName: string, description: stri
  * problems of the integration account: report them as such (503), not as a transient 502.
  */
 const PERMANENT_REFUSAL = /user type extension|not been assigned|not licensed|license|permission|not authorized|insufficient privilege|does not have (the )?(required )?privilege/i;
+/** Posting into a protected sde.DEFAULT needs a version administrator ("Manage versions" privilege). */
+const PROTECTED_VERSION = /only be executed by the owner|version is protected/i;
 
 export function asConfigurationError(error: unknown): unknown {
+  if (error instanceof ArcGisError && PROTECTED_VERSION.test(error.message)) {
+    return new LaisConfigurationError(
+      `The LAIS ArcGIS account cannot post to the protected default version: give it the Portal "Manage versions" privilege (version administrator). ArcGIS: ${error.message}`,
+    );
+  }
   if (error instanceof ArcGisError && (error.code === 403 || PERMANENT_REFUSAL.test(error.message))) {
     return new LaisConfigurationError(`The LAIS ArcGIS account cannot edit: ${error.message}`);
   }
@@ -601,7 +608,7 @@ function assertSuccess(body: ArcGisJson, what: string): void {
 }
 
 /** Attribute updates of the transaction's Plots inside `version`, in one exclusive edit session (all or none). */
-async function editInVersion(token: string, version: VersionRef, updates: Attributes[]): Promise<void> {
+export async function editInVersion(token: string, version: VersionRef, updates: Attributes[]): Promise<void> {
   const sessionId = `{${randomUUID().toUpperCase()}}`;
   const versionUrl = `${config.lais.versionManagementUrl}/versions/${version.guid.replace(/[{}]/g, "")}`;
   let reading = false;

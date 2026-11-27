@@ -31,6 +31,25 @@ foreach ($k in 'NODE_ENV','PORT','APP_ORIGINS','PORTAL_URL','ARCGIS_SERVER_URL',
 "{0,-22} = {1}" -f 'LAIS_ARCGIS_PASSWORD', ($(if ($cfg['LAIS_ARCGIS_PASSWORD']) { 'set' } else { 'MISSING' }))
 $key = $cfg['LAIS_API_KEY']
 
+Section "2b. LAIS editing-done flow (GIS -> LAIS webhook, then LAIS approve)"
+"{0,-22} = {1}" -f 'LAIS_EDITING_DONE', $cfg['LAIS_EDITING_DONE']
+"{0,-22} = {1}" -f 'LAIS_WEBHOOK_KEY length', ("" + $cfg['LAIS_WEBHOOK_KEY']).Length
+$hook = $cfg['LAIS_WEBHOOK_URL']
+if ($hook -match '^(https?)://([^/:]+)(:(\d+))?') {
+  $port = if ($matches[4]) { [int]$matches[4] } elseif ($matches[1] -eq 'https') { 443 } else { 80 }
+  "LAIS_WEBHOOK_URL host   = $($matches[2]):$port ($($matches[1]))"
+  if ($matches[1] -eq 'http') { "WARNING: plain http - the LAIS key travels unencrypted; ask LAIS for https." }
+  # Connection test only: opens a TCP connection and closes it. Nothing is sent to LAIS.
+  $client = New-Object System.Net.Sockets.TcpClient
+  try {
+    $ok = $client.ConnectAsync($matches[2], $port).Wait(5000) -and $client.Connected
+    if ($ok) { "LAIS endpoint REACHABLE from this server" } else { "LAIS endpoint NOT reachable from this server (timeout) - firewall/VPN between this server and LAIS needed" }
+  } catch { "LAIS endpoint NOT reachable from this server: $($_.Exception.InnerException.Message)" } finally { $client.Close() }
+} else { "LAIS_WEBHOOK_URL is empty - 'Editing done' cannot reach LAIS" }
+if ($cfg['NODE_ENV'] -eq 'production' -and ("" + $cfg['APP_ORIGINS']) -notmatch 'https://') {
+  "WARNING: APP_ORIGINS has no public https origin - editors on the public web app cannot sign in to the API"
+}
+
 Section "3. Direct to Node (bypassing IIS)"
 curl.exe -s -i -m 20 http://127.0.0.1:4001/api/health
 ""

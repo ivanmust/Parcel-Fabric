@@ -11,6 +11,7 @@ import { api } from "./routes/index.js";
 import { lais } from "./routes/lais.js";
 import { laisWorkflow } from "./routes/laisWorkflow.js";
 import { laisEditing } from "./routes/laisEditing.js";
+import { webhooks } from "./routes/webhooks.js";
 import { bookmarks } from "./routes/bookmarks.js";
 import { docs } from "./routes/docs.js";
 import { errorHandler, isLaisRequest, notFound } from "./middleware/errorHandler.js";
@@ -92,6 +93,7 @@ export function createApp() {
   app.use("/api/lais", lais);
   app.use("/api/lais-workflow", laisWorkflow);
   app.use("/api/lais-editing", laisEditing);
+  app.use("/api/webhooks", webhooks);
   app.use("/api", bookmarks);
   if (config.API_DOCS ? config.API_DOCS === "true" : config.NODE_ENV !== "production") app.use("/api", docs);
   app.use("/api", notFound);

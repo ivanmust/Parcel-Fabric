@@ -1,6 +1,5 @@
-import { createHash, timingSafeEqual } from "node:crypto";
 import { Router, type Request, type Response } from "express";
-import { config } from "../config/env.js";
+import { requireLaisApiKey } from "../middleware/apiKey.js";
 import { HttpError } from "../utils/httpError.js";
 import { logger } from "../logging/logger.js";
 import { writeAudit } from "../audit/auditLog.js";
@@ -18,6 +17,7 @@ import {
 } from "../lais/laisService.js";
 import { approveTransaction, CELL_PATTERN, DecisionError, rejectTransaction } from "../lais/approval.js";
 import { editingDoneEnabled } from "../lais/editingDone.js";
+import { ChangesError, versionChanges } from "../lais/versionChanges.js";
 
 /**
  * LAIS server-to-server API (mounted at /api/lais).
@@ -29,33 +29,12 @@ import { editingDoneEnabled } from "../lais/editingDone.js";
  */
 export const lais = Router();
 
-function sameSecret(received: string | undefined, expected: string): boolean {
-  if (!received) return false;
-  const a = createHash("sha256").update(received).digest();
-  const b = createHash("sha256").update(expected).digest();
-  return timingSafeEqual(a, b);
-}
-
 export function laisFailure(req: Request, res: Response, status: number, message: string, errors: FieldError[]) {
   res.status(status).json({ success: false, case: "No", message, errors, requestId: req.id });
 }
 
-/**
- * Dedicated LAIS authentication; never accepts or reuses a browser Portal token. During a key change
- * LAIS_API_KEY_PREVIOUS (the old key) is accepted too, so LAIS can switch without downtime; remove it
- * once LAIS uses the new key. Keys shorter than 32 characters are never accepted.
- */
-lais.use((req, _res, next) => {
-  const received = req.header("x-api-key");
-  const keys = [config.LAIS_API_KEY, config.LAIS_API_KEY_PREVIOUS].filter((k) => k.length >= 32);
-  // Compare against every key (constant time each), so timing doesn't reveal which one matched.
-  const matches = keys.map((k) => sameSecret(received, k));
-  if (config.LAIS_API_KEY.length < 32 || !matches.some(Boolean)) {
-    throw new HttpError(401, "Valid LAIS API credentials are required", "unauthorized");
-  }
-  if (!matches[0]) logger.warn({ requestId: req.id }, "LAIS authenticated with the previous API key; finish the key change");
-  next();
-});
+/** Dedicated LAIS authentication (X-API-Key, see requireLaisApiKey); never a browser Portal token. */
+lais.use(requireLaisApiKey);
 
 function audit(req: Request, transactionId: string | undefined, outcome: "success" | "failure", details: Record<string, unknown>) {
   void writeAudit({
@@ -279,4 +258,17 @@ lais.get("/transactions/:transactionId", async (req, res) => {
     return laisFailure(req, res, 409, "GIS holds more than one record for this Transaction_ID.", [{ field: "Transaction_ID", code: "DUPLICATE_TRANSACTION_ID", message: "Contact the GIS integration administrator." }]);
   }
   res.json({ success: true, case: outcome.record.case ?? "Yes", message: "Transaction found.", data: outcome.record });
+});
+
+/** What the transaction's version changed compared with sde.DEFAULT (ArcGIS "differences"): the review data. */
+lais.get("/transactions/:transactionId/changes", async (req, res) => {
+  const id = String(req.params.transactionId ?? "").trim();
+  const geometry = String(req.query.geometry ?? "false").toLowerCase() === "true";
+  try {
+    const data = await withServiceToken((token) => versionChanges(token, id, { geometry }));
+    res.json({ success: true, message: data.warnings.length ? "Changes read; see warnings." : "Changes read.", data });
+  } catch (error) {
+    if (error instanceof ChangesError) return laisFailure(req, res, error.status, error.message, [{ field: "Transaction_ID", code: error.code, message: error.message }]);
+    throw gisFailure(error, id, "changes");
+  }
 });

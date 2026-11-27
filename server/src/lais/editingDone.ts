@@ -2,9 +2,9 @@ import { randomUUID } from "node:crypto";
 import { config } from "../config/env.js";
 import { logger } from "../logging/logger.js";
 import { writeAudit } from "../audit/auditLog.js";
-import { arcgisPost } from "./arcgisClient.js";
+import { arcgisPost, withServiceToken } from "./arcgisClient.js";
 import { allEntries, getEntry, putEntry, type EditingDone, type LedgerEntry } from "./ledger.js";
-import { LaisConfigurationError, layerSchema, ownedVersions, shortVersionName, sql, withLock, type Attributes, type LayerSchema, type Optional } from "./laisService.js";
+import { editInVersion, LaisConfigurationError, layerSchema, ownedVersions, shortVersionName, sql, sqlList, withLock, type Attributes, type LayerSchema, type Optional } from "./laisService.js";
 
 /**
  * GIS → LAIS "editing done" notification.
@@ -254,9 +254,9 @@ async function entryOrThrow(transactionId: string): Promise<LedgerEntry> {
   return entry;
 }
 
-/** What would be sent, without sending it: for the editor to check first. */
-export async function previewEditingDone(token: string, transactionId: string, editedBy: string, recordName?: string): Promise<Preview> {
-  return buildFor(token, await entryOrThrow(transactionId), editedBy, recordName);
+/** What would be sent, without sending it: for the editor to check first. `editedBy` is the signed-in editor (empty for an API-key client). */
+export async function previewEditingDone(transactionId: string, recordName?: string, editedBy = ""): Promise<Preview> {
+  return withServiceToken(async (token) => buildFor(token, await entryOrThrow(transactionId), editedBy, recordName));
 }
 
 // ---------------------------------------------------------------- state for the web app
@@ -324,7 +324,13 @@ function decisionOf(e: LedgerEntry) {
  * The editor says the work is done: check it, record the notification, and make the first attempt.
  * A notification LAIS has received is never sent twice; one still being sent is not duplicated.
  */
-export async function requestEditingDone(token: string, transactionId: string, editedBy: string, recordName?: string): Promise<{ view: EditingDoneView; warnings: string[] }> {
+export async function requestEditingDone(
+  token: string,
+  transactionId: string,
+  editedBy: string,
+  recordName?: string,
+  via: "button" | "field" = "button",
+): Promise<{ view: EditingDoneView; warnings: string[] }> {
   if (!webhookConfigured()) throw new EditingDoneError(503, "not_configured", "The LAIS endpoint is not configured on this server (LAIS_WEBHOOK_URL and LAIS_WEBHOOK_KEY).");
   const queued = await withLock(transactionId.toLowerCase(), async () => {
     const entry = await entryOrThrow(transactionId);
@@ -358,8 +364,13 @@ export async function requestEditingDone(token: string, transactionId: string, e
     };
     // Not something LAIS sees through GET /transactions: its updated_at stays as it was.
     await putEntry({ ...entry, editingDone }, { keepUpdatedAt: true });
-    logger.info({ transactionId, eventId: editingDone.eventId, record: preview.payload.record_name, parcels: preview.payload.proposed_parcels.length }, "LAIS editing done: notification queued");
-    return { warnings: preview.warnings, resend: true };
+    logger.info({ transactionId, eventId: editingDone.eventId, record: preview.payload.record_name, parcels: preview.payload.proposed_parcels.length, via }, "LAIS editing done: notification queued");
+    // The status is also kept in GIS: editing_status = "Edits done" on the new parcels, in the version.
+    const marked = await markEditsDone(token, entry, preview.payload).catch((error: Error) => {
+      logger.warn({ transactionId, err: error.message }, 'LAIS editing done: could not write editing_status = "Edits done" in the version');
+      return `GIS could not write editing_status = "${EDITS_DONE}" on the new parcels (${error.message}); LAIS is notified anyway.`;
+    });
+    return { warnings: typeof marked === "string" ? [...preview.warnings, marked] : preview.warnings, resend: true };
   });
   if (queued.resend) await deliver(transactionId, Date.now(), true);
   const entry = await entryOrThrow(transactionId);
@@ -445,7 +456,110 @@ export async function deliverDueEditingDone(now = Date.now()): Promise<void> {
   }
 }
 
-/** Retry loop for the running server. Does nothing while the feature is off. */
+// ---------------------------------------------------------------- editing_status = "Edits done"
+
+/** The Plot field's coded value (domain of editing_status). */
+export const EDITS_DONE = "Edits done";
+
+/** The Plot layer's editing_status field (its exact name), or null when the layer has none. */
+const editingStatusField = (schema: LayerSchema) => Object.keys(schema.fieldTypes).find((f) => f.toLowerCase() === "editing_status") ?? null;
+
+/** Write editing_status = "Edits done" on the new parcels of this work, inside the transaction's version. */
+async function markEditsDone(token: string, entry: LedgerEntry, payload: EditingDoneBody): Promise<void> {
+  const schema = await layerSchema(token);
+  const field = editingStatusField(schema);
+  if (!field || !schema.globalIdField || !entry.versionName || !payload.proposed_parcels.length) return;
+  const version = (await ownedVersions(token)).get(shortVersionName(entry.versionName).toLowerCase());
+  if (!version) return;
+  const oid = schema.objectIdField;
+  const refs = payload.proposed_parcels.map((p) => p.parcel_ref);
+  const body = await arcgisPost(
+    `${config.lais.plotLayerUrl}/query`,
+    { where: `${schema.globalIdField} IN (${sqlList(refs)})`, outFields: [oid, field].join(","), returnGeometry: "false", gdbVersion: version.name },
+    token,
+  );
+  const todo = ((body.features ?? []) as Array<{ attributes: Attributes }>).map((f) => f.attributes).filter((a) => a[field] !== EDITS_DONE);
+  if (!todo.length) return;
+  await editInVersion(token, version, todo.map((a) => ({ [oid]: a[oid], [field]: EDITS_DONE })));
+}
+
+/** Last problem logged per transaction by the scan, so an unfinished version is reported once, not every few minutes. */
+const scanNotes = new Map<string, string>();
+
+/**
+ * Editors who finish in ArcGIS Pro (or any attribute form) set editing_status = "Edits done" on the new
+ * parcels instead of pressing the web-app button. For each open LAIS transaction, look in its version
+ * for such parcels (created by the record named after the version, or for a boundary correction the
+ * transaction's own parcels) and send "Editing done" like the button would. Never twice for the same
+ * work: LAIS already has it, or it was rejected/refused and the editor has not changed it since.
+ */
+export async function scanEditsDoneField(token: string): Promise<string[]> {
+  const sent: string[] = [];
+  if (!editingDoneEnabled() || !webhookConfigured()) return sent;
+  const schema = await layerSchema(token);
+  const field = editingStatusField(schema);
+  const r = schema.records;
+  if (!field || !r) return sent;
+  const f = schema.fields;
+  const owned = await ownedVersions(token);
+
+  for (const entry of await allEntries()) {
+    if (!entry.versionName || entry.completion || entry.approval) continue;
+    const previous = entry.editingDone;
+    if (previous && (previous.status === "sending" || previous.status === "retrying")) continue;
+    const rejected = !!previous && (entry.rejections ?? []).some((x) => x.eventId === previous.eventId);
+    if (previous?.status === "delivered" && !rejected) continue; // LAIS has it and has not decided against it
+    const short = shortVersionName(entry.versionName);
+    const version = owned.get(short.toLowerCase());
+    if (!version) continue;
+    try {
+      // Parcels of this work marked "Edits done" in the version.
+      const rec = await arcgisPost(`${r.url}/query`, { where: `UPPER(${r.nameField}) = ${sql(short.toUpperCase())}`, outFields: r.globalIdField, returnGeometry: "false", gdbVersion: version.name }, token);
+      const recordIds = ((rec.features ?? []) as Array<{ attributes: Attributes }>).map((x) => String(x.attributes[r.globalIdField] ?? "")).filter(Boolean);
+      const ofWork = [
+        ...(recordIds.length ? [`${f.createdBy} IN (${sqlList(recordIds)})`] : []),
+        ...(entry.Transaction_Type === "CorrectBoundaries" && entry.objectIds.length ? [`${schema.objectIdField} IN (${entry.objectIds.join(",")})`] : []),
+      ];
+      if (!ofWork.length) continue;
+      const lastEditor = Object.keys(schema.fieldTypes).find((x) => x.toLowerCase() === "last_edited_user");
+      const marked = await arcgisPost(
+        `${config.lais.plotLayerUrl}/query`,
+        { where: `${ofWork.length === 1 ? ofWork[0] : `(${ofWork.join(" OR ")})`} AND ${f.retiredBy} IS NULL AND ${field} = ${sql(EDITS_DONE)}`, outFields: [schema.objectIdField, ...(lastEditor ? [lastEditor] : [])].join(","), returnGeometry: "false", gdbVersion: version.name },
+        token,
+      );
+      const rows = ((marked.features ?? []) as Array<{ attributes: Attributes }>).map((x) => x.attributes);
+      if (!rows.length) continue;
+      const editedBy = (lastEditor && rows.map((a) => a[lastEditor]).find((v): v is string => typeof v === "string" && !!v)) || "ArcGIS (editing_status)";
+
+      // Rejected or refused before: only revised work is sent again.
+      if (previous) {
+        const now = await buildFor(token, entry, editedBy);
+        if (!now.payload || workFingerprint(now.payload) === workFingerprint(previous.payload as unknown as EditingDoneBody)) continue;
+      }
+      const { view } = await requestEditingDone(token, entry.Transaction_ID, editedBy, undefined, "field");
+      scanNotes.delete(entry.Transaction_ID);
+      sent.push(entry.Transaction_ID);
+      logger.info({ transactionId: entry.Transaction_ID, editedBy, status: view.status, eventId: view.event_id }, 'LAIS editing done: sent because the parcels are marked editing_status = "Edits done"');
+      void writeAudit({
+        username: editedBy,
+        appRole: "EDITOR",
+        action: "lais.editing-done",
+        target: entry.Transaction_ID,
+        outcome: view.status === "refused" || view.status === "failed" ? "failure" : "success",
+        details: { via: "editing_status field", event_id: view.event_id, status: view.status, record: view.record_name, parcels: view.parcels },
+      }).catch(() => undefined);
+    } catch (error) {
+      const note = (error as Error).message;
+      if (scanNotes.get(entry.Transaction_ID) !== note) {
+        scanNotes.set(entry.Transaction_ID, note);
+        logger.warn({ transactionId: entry.Transaction_ID, problem: note }, 'LAIS editing done: parcels are marked "Edits done" but the work cannot be sent yet');
+      }
+    }
+  }
+  return sent;
+}
+
+/** Retry loop (and the "Edits done" field scan) for the running server. Does nothing while the feature is off. */
 export function startEditingDoneRetries(intervalMs = 30_000): (() => void) | null {
   if (!editingDoneEnabled()) return null;
   if (!webhookConfigured()) logger.warn("LAIS_EDITING_DONE is on but LAIS_WEBHOOK_URL or LAIS_WEBHOOK_KEY is empty: notifications cannot be sent");
@@ -458,5 +572,19 @@ export function startEditingDoneRetries(intervalMs = 30_000): (() => void) | nul
   tick();
   const timer = setInterval(tick, intervalMs);
   timer.unref();
-  return () => clearInterval(timer);
+
+  let scanning = false;
+  const scan = () => {
+    if (scanning) return;
+    scanning = true;
+    void withServiceToken((token) => scanEditsDoneField(token))
+      .catch((error) => logger.error({ err: (error as Error).message }, 'LAIS editing done: the "Edits done" scan failed'))
+      .finally(() => (scanning = false));
+  };
+  const scanTimer = config.LAIS_EDITS_DONE_SCAN_MS > 0 ? setInterval(scan, config.LAIS_EDITS_DONE_SCAN_MS) : null;
+  scanTimer?.unref();
+  return () => {
+    clearInterval(timer);
+    if (scanTimer) clearInterval(scanTimer);
+  };
 }

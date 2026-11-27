@@ -8,9 +8,10 @@
     "start": "node --env-file-if-exists=.env dist/index.js",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --import tsx --test test/lais.test.ts test/audit.test.ts",
+    "test": "node --import tsx --test test/*.test.ts",
     "inspect-services": "tsx --env-file-if-exists=.env src/scripts/inspectServices.ts",
-    "mock-lais": "tsx src/scripts/mockLaisWebhook.ts"
+    "mock-lais": "tsx src/scripts/mockLaisWebhook.ts",
+    "mock-app-b": "tsx src/scripts/mockAppB.ts"
   },
   "dependencies": {
     "express": "5.1.0",

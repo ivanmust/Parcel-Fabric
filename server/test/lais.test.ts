@@ -20,6 +20,7 @@ const RECORDS = `${SERVER}/rest/services/ParcelFabric/FeatureServer/2`;
 const REFERER = "https://gis-api.test";
 const WEBHOOK = "https://lais-webhook.test/editing-done";
 const WEBHOOK_KEY = "key-issued-by-lais-0123456789";
+const APP_B = "https://app-b.test/hooks/gis";
 const OWNER = "svc_lais";
 const auditDir = mkdtempSync(path.join(tmpdir(), "lais-audit-"));
 
@@ -65,6 +66,8 @@ const FIELDS = [
   { name: "parcel_number" },
   { name: "globalid" },
   { name: "last_edited_date", type: "esriFieldTypeDate" },
+  { name: "last_edited_user" },
+  { name: "editing_status", domain: { codedValues: [{ code: "Edits done", name: "Edits done" }] } },
 ];
 const RECORD_FIELDS = [{ name: "objectid" }, { name: "name" }, { name: "recordeddate" }, { name: "globalid" }, { name: "transaction_id" }];
 
@@ -77,6 +80,8 @@ const fake = {
   versionRecords: new Map<string, Attrs[]>(),
   /** What the LAIS "editing done" endpoint received, and the answers it gives (then 200). */
   webhook: { calls: [] as Array<{ headers: Headers; body: Record<string, any> }>, answers: [] as Array<{ status: number; body?: unknown } | "timeout"> },
+  /** The subdivision completion webhook receiver ("App B"). */
+  appB: { calls: [] as Array<{ headers: Headers; raw: string }> },
   versions: [] as FakeVersion[],
   branchVersioned: true,
   failNextApplyEdits: false,
@@ -86,6 +91,8 @@ const fake = {
   reconcileConflict: false,
   /** Another session holds the version (startEditing refused). */
   versionLocked: false,
+  /** sde.DEFAULT is protected and the account is no version administrator (post refused). */
+  defaultProtected: false,
   /** DEFAULT parcels posted after the versions' last reconcile: versions do not see them. */
   hiddenFromVersions: new Set<number>(),
   tokenSerial: 0,
@@ -108,6 +115,7 @@ const fake = {
     this.records = [];
     this.versionRecords = new Map();
     this.webhook = { calls: [], answers: [] };
+    this.appB = { calls: [] };
     this.versions = [];
     this.branchVersioned = true;
     this.failNextApplyEdits = false;
@@ -115,6 +123,7 @@ const fake = {
     this.refuseLicense = false;
     this.reconcileConflict = false;
     this.versionLocked = false;
+    this.defaultProtected = false;
     this.hiddenFromVersions = new Set();
   },
 };
@@ -203,13 +212,18 @@ globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) =>
     if (answer === "timeout") throw Object.assign(new Error("The operation was aborted due to timeout"), { name: "TimeoutError" });
     return json(answer.body ?? {}, answer.status);
   }
+  if (url === APP_B) {
+    fake.appB.calls.push({ headers: new Headers(init?.headers), raw: String(init?.body) });
+    return json({ received: true });
+  }
   if (!url.startsWith("https://fake-gis.test")) return realFetch(input, init);
   const params = Object.fromEntries(new URLSearchParams(String(init?.body ?? "")));
   const headers = new Headers(init?.headers);
   fake.calls.push({ url, params, referer: headers.get("referer") });
 
   if (url === `${PORTAL}/sharing/rest/community/self`) {
-    // Web-app users: "editor-*" tokens can edit features; anything else is a viewer.
+    // Web-app users: "admin-*" tokens are org administrators, "editor-*" can edit features, anything else is a viewer.
+    if (params.token?.startsWith("admin-")) return json({ username: "admin.one", fullName: "Test Admin", role: "org_admin", privileges: ["features:user:edit"] });
     const editor = params.token?.startsWith("editor-");
     return json({ username: editor ? "editor.one" : "viewer.one", fullName: "Test User", role: "org_user", privileges: editor ? ["features:user:edit"] : [] });
   }
@@ -234,8 +248,9 @@ globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) =>
   }
   if (url === `${PLOT}/query`) {
     if (Number(params.resultOffset ?? 0) > 0) return json({ features: [] }); // the fake answers in one page
-    const match = where(params.where!);
-    let rows = [...viewOf(params.gdbVersion).values()].filter(match);
+    const match = params.where ? where(params.where) : () => true;
+    const ids = params.objectIds ? new Set(params.objectIds.split(",").map(Number)) : null;
+    let rows = [...viewOf(params.gdbVersion).values()].filter((r) => match(r) && (!ids || ids.has(Number(r.objectid))));
     if (params.spatialRel === "esriSpatialRelRelation") {
       const shape = boxOf(JSON.parse(params.geometry!).rings[0]);
       rows = rows.filter((r) => relates(shape, BOXES[r.objectid as number]!, params.relationParam!));
@@ -255,6 +270,27 @@ globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) =>
     fake.versions.push(v);
     return json({ success: true, versionInfo: { versionName: v.name, versionGuid: v.guid, access: v.access } });
   }
+  // differences: the version's saved edits compared with DEFAULT (Plot = layer 17, Records = layer 2).
+  const diff = /\/versions\/([^/]+)\/differences$/.exec(url);
+  if (diff) {
+    const v = fake.versions.find((x) => x.guid.replace(/[{}]/g, "") === diff[1]);
+    if (!v) return json({ error: { code: 404, message: "no such version" } });
+    if (fake.versionLocked) return json({ error: { code: 500, message: "Another user has an active Write transaction lock." } });
+    const plotInserts: Attrs[] = [];
+    const plotUpdates: Attrs[] = [];
+    for (const [oid, a] of v.saved) (fake.plots.has(oid) ? plotUpdates : plotInserts).push({ ...fake.plots.get(oid), ...a });
+    const recordInserts = fake.versionRecords.get(v.name) ?? [];
+    const layers = params.layers ? (JSON.parse(params.layers) as number[]) : [2, 17];
+    const shape = (a: Attrs) => (BOXES[a.objectid as number] ? { geometry: ringsOf(BOXES[a.objectid as number]!) } : {});
+    const all = [
+      { layerId: 2, inserts: recordInserts, updates: [] as Attrs[] },
+      { layerId: 17, inserts: plotInserts, updates: plotUpdates },
+    ].filter((l) => layers.includes(l.layerId) && (l.inserts.length || l.updates.length));
+    if (params.resultType === "features") {
+      return json({ success: true, features: all.map((l) => ({ layerId: l.layerId, inserts: l.inserts.map((a) => ({ attributes: a, ...shape(a) })), updates: l.updates.map((a) => ({ attributes: a, ...shape(a) })) })) });
+    }
+    return json({ success: true, differences: all.map((l) => ({ layerId: l.layerId, inserts: l.inserts.map((a) => a.objectid), updates: l.updates.map((a) => a.objectid), deletes: [] })) });
+  }
   const vm = /\/versions\/([^/]+)\/(startReading|startEditing|stopEditing|stopReading|reconcile)$/.exec(url);
   if (vm) {
     const v = fake.versions.find((x) => x.guid.replace(/[{}]/g, "") === vm[1]);
@@ -268,6 +304,7 @@ globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) =>
     if (vm[2] === "reconcile") {
       if (!v.pending) return json({ error: { code: 400, message: "reconcile needs an edit session" } });
       if (fake.reconcileConflict) return json({ success: true, hasConflicts: true, didPost: false });
+      if (fake.defaultProtected && params.withPost === "true") return json({ error: { code: 200, message: "Operation can only be executed by the owner since the version is protected." } });
       if (params.withPost === "true") {
         // Post: the version's saved edits and its records reach DEFAULT.
         for (const [oid, a] of v.saved) fake.plots.set(oid, { ...fake.plots.get(oid), ...a });
@@ -314,6 +351,7 @@ let cfg: {
   LAIS_EDITING_DONE: "true" | "false";
   LAIS_WEBHOOK_URL: string;
   LAIS_WEBHOOK_KEY: string;
+  SUBDIVISION_WEBHOOK_SINCE: string;
 };
 
 before(async () => {
@@ -1051,6 +1089,28 @@ describe("editing done: GIS tells LAIS the work is ready for the registrar", () 
     assert.equal((await editing("/transactions", { token: "viewer-token" })).status, 403);
   });
 
+  test("preview also opens with the LAIS API key (e.g. Swagger); only preview, and a wrong key is refused", async () => {
+    subdivideInVersion();
+    const preview = `${editingBase()}/transactions/${valid.Transaction_ID}/preview`;
+    const withKey = await fetch(preview, { headers: { "x-api-key": KEY, ...client() } });
+    assert.equal(withKey.status, 200);
+    assert.equal(((await withKey.json()) as Record<string, any>).payload.version_name, VERSION);
+    assert.equal((await fetch(preview, { headers: { "x-api-key": "wrong", ...client() } })).status, 401);
+    // A wrong key is refused even with a valid editor token next to it.
+    assert.equal((await fetch(preview, { headers: { "x-api-key": "wrong", Authorization: "Bearer editor-token", ...client() } })).status, 401);
+    assert.equal((await fetch(preview, { headers: client() })).status, 401);
+    assert.equal((await editing(`/transactions/${valid.Transaction_ID}/preview`, { token: "viewer-token" })).status, 403);
+    // The key opens nothing else under /lais-editing.
+    assert.equal((await fetch(`${editingBase()}/transactions`, { headers: { "x-api-key": KEY, ...client() } })).status, 401);
+    const send = await fetch(`${editingBase()}/transactions/${valid.Transaction_ID}/editing-done`, {
+      method: "POST",
+      headers: { "x-api-key": KEY, "Content-Type": "application/json", ...client() },
+      body: "{}",
+    });
+    assert.equal(send.status, 401);
+    assert.equal(fake.webhook.calls.length, 0);
+  });
+
   test("preview: the agreed format, built from the version, and nothing sent", async () => {
     subdivideInVersion();
     const r = await editing(`/transactions/${valid.Transaction_ID}/preview`);
@@ -1098,6 +1158,150 @@ describe("editing done: GIS tells LAIS the work is ready for the registrar", () 
     assert.equal(list.body.transactions[0].editing_done.parcels, 2);
     const after = await laisView();
     assert.equal(after.data.updated_at, before.data.updated_at, "LAIS's polling must not see a change");
+  });
+
+  test('the button also writes editing_status = "Edits done" on the new parcels, in the version only', async () => {
+    subdivideInVersion();
+    const r = await done();
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    const v = fake.versions.find((x) => x.name === VERSION)!;
+    assert.deepEqual([v.saved.get(11)!.editing_status, v.saved.get(12)!.editing_status], ["Edits done", "Edits done"]);
+    assert.equal(fake.plots.get(11)?.editing_status, undefined, "never written in DEFAULT");
+    assert.ok(gisCalls("/applyEdits").every((c) => c.params.gdbVersion === VERSION));
+    assert.equal(fake.webhook.calls.length, 1);
+  });
+
+  describe('editors who set editing_status = "Edits done" themselves (e.g. ArcGIS Pro)', () => {
+    let scan: (token: string) => Promise<string[]>;
+    before(async () => {
+      ({ scanEditsDoneField: scan } = await import("../src/lais/editingDone.js"));
+    });
+    const markInVersion = (ids: number[], editor = "pro.editor") => {
+      const v = fake.versions.find((x) => x.name === VERSION)!;
+      for (const id of ids) Object.assign(v.saved.get(id)!, { editing_status: "Edits done", last_edited_user: editor });
+    };
+
+    test("nothing marked: nothing sent", async () => {
+      subdivideInVersion();
+      assert.deepEqual(await scan("svc-token"), []);
+      assert.equal(fake.webhook.calls.length, 0);
+    });
+
+    test("marked: GIS sends Editing done itself, once, with the editor from the parcels", async () => {
+      subdivideInVersion();
+      markInVersion([11]);
+      assert.deepEqual(await scan("svc-token"), [valid.Transaction_ID]);
+      assert.equal(fake.webhook.calls.length, 1);
+      assert.equal(fake.webhook.calls[0]!.body.edited_by, "pro.editor");
+      assert.equal(fake.webhook.calls[0]!.body.proposed_parcels.length, 2);
+      const v = fake.versions.find((x) => x.name === VERSION)!;
+      assert.equal(v.saved.get(12)!.editing_status, "Edits done", "the other new parcel is marked too");
+      assert.deepEqual(await scan("svc-token"), [], "LAIS has it: not sent again");
+      assert.equal(fake.webhook.calls.length, 1);
+    });
+
+    test("a parcel marked in DEFAULT (not created by this transaction's record) is ignored", async () => {
+      subdivideInVersion();
+      Object.assign(fake.plots.get(4)!, { editing_status: "Edits done" });
+      assert.deepEqual(await scan("svc-token"), []);
+      assert.equal(fake.webhook.calls.length, 0);
+    });
+
+    test("marked but the work is unfinished: not sent, and retried silently on the next scans", async () => {
+      subdivideInVersion({ parcels: [11] }); // a subdivision needs 2 parcels
+      markInVersion([11]);
+      assert.deepEqual(await scan("svc-token"), []);
+      assert.deepEqual(await scan("svc-token"), []);
+      assert.equal(fake.webhook.calls.length, 0);
+    });
+
+    test("after a rejection the same work is not resent; revised work is", async () => {
+      subdivideInVersion();
+      markInVersion([11, 12]);
+      await scan("svc-token");
+      const eventId = fake.webhook.calls[0]!.body.event_id;
+      const rej = await fetch(`${base}/transactions/${valid.Transaction_ID}/reject`, {
+        method: "POST",
+        headers: { "x-api-key": KEY, "Content-Type": "application/json", ...client() },
+        body: JSON.stringify({ event_id: eventId, rejected_by: "registrar", reason: "redo the boundary" }),
+      });
+      assert.equal(rej.status, 200);
+      assert.deepEqual(await scan("svc-token"), [], "unchanged work is not sent again");
+      assert.equal(fake.webhook.calls.length, 1);
+      // the editor revises: a third parcel
+      const v = fake.versions.find((x) => x.name === VERSION)!;
+      v.saved.set(13, { objectid: 13, globalid: "{G-13}", name: null, createdbyrecord: "{REC-1}", size: 20, ...PLACE, editing_status: "Edits done" });
+      assert.deepEqual(await scan("svc-token"), [valid.Transaction_ID]);
+      assert.equal(fake.webhook.calls.length, 2);
+      assert.notEqual(fake.webhook.calls[1]!.body.event_id, eventId);
+    });
+  });
+
+  describe("changes: what the version changed compared with sde.DEFAULT (ArcGIS differences)", () => {
+    const changes = async (id = valid.Transaction_ID, query = "") => {
+      const res = await fetch(`${base}/transactions/${encodeURIComponent(id)}/changes${query}`, { headers: { "x-api-key": KEY, ...client() } });
+      return { status: res.status, body: (await res.json()) as Record<string, any> };
+    };
+
+    test("the subdivision LAIS asked for: 2 new parcels, the parent retired by the version's record, no warnings", async () => {
+      subdivideInVersion();
+      const r = await changes();
+      assert.equal(r.status, 200, JSON.stringify(r.body));
+      const d = r.body.data;
+      assert.equal(d.version_name, VERSION);
+      assert.equal(d.compared_with, "sde.DEFAULT");
+      assert.deepEqual(d.summary.find((s: any) => s.layer_id === 17), { layer_id: 17, layer_name: "Layer 17", inserts: 2, updates: 1, deletes: 0 });
+      assert.deepEqual(d.plots.inserted.map((p: any) => [p.object_id, p.global_id, p.UPI, p.record]), [[11, "{G-11}", null, RECORD], [12, "{G-12}", null, RECORD]]);
+      assert.deepEqual(d.plots.updated.map((p: any) => [p.UPI, p.retired, p.record, Object.keys(p.changed_fields)]), [["1/02/13/02/1001", true, RECORD, ["retiredbyrecord"]]]);
+      assert.deepEqual(d.plots.updated[0].changed_fields.retiredbyrecord, { before: null, after: "{REC-1}" });
+      assert.deepEqual(d.records, [{ change: "inserted", global_id: "{REC-1}", name: RECORD }]);
+      assert.deepEqual(d.checks, { transaction_parcels_unchanged: [], other_parcels_changed: [] });
+      assert.deepEqual(d.warnings, []);
+      assert.equal(d.plots.inserted[0].geometry, undefined, "geometry only when asked");
+      assert.equal(gisCalls("/startEditing").length, 0, "read-only");
+    });
+
+    test("the wrong parcel worked on: both problems are named", async () => {
+      subdivideInVersion({ retire: 4 });
+      const d = (await changes()).body.data;
+      assert.deepEqual(d.checks, { transaction_parcels_unchanged: ["1/02/13/02/1001"], other_parcels_changed: ["1/02/13/02/3003"] });
+      assert.match(d.warnings.join(" "), /does not change the transaction's parcel 1\/02\/13\/02\/1001/);
+      assert.match(d.warnings.join(" "), /also changes a parcel that is not in the transaction: 1\/02\/13\/02\/3003/);
+    });
+
+    test("a record not named after the version, and a new UPI already used in DEFAULT, are warned about", async () => {
+      subdivideInVersion({ recordName: "Remera_Nyarutarama_Kamahwa_2026-11-18" });
+      Object.assign(fake.versions.find((x) => x.name === VERSION)!.saved.get(11)!, { name: "1/02/13/02/3003" });
+      const d = (await changes()).body.data;
+      assert.match(d.warnings.join(" "), /uses the record Remera_Nyarutarama_Kamahwa_2026-11-18, not one named after the version/);
+      assert.match(d.warnings.join(" "), /New parcel has the UPI 1\/02\/13\/02\/3003, already used by a current parcel/);
+    });
+
+    test("geometry=true: GeoJSON for the new parcels", async () => {
+      subdivideInVersion();
+      const d = (await changes(valid.Transaction_ID, "?geometry=true")).body.data;
+      assert.equal(d.plots.inserted[0].geometry.type, "Polygon");
+    });
+
+    test("nothing saved yet, version being edited, unknown transaction", async () => {
+      let r = await changes();
+      assert.equal(r.status, 200);
+      assert.match(r.body.data.warnings[0], /no changes yet/);
+      fake.versionLocked = true;
+      r = await changes();
+      assert.deepEqual([r.status, codes(r.body)], [409, ["VERSION_IN_USE"]]);
+      fake.versionLocked = false;
+      r = await changes("NO-SUCH-ID");
+      assert.deepEqual([r.status, codes(r.body)], [404, ["NOT_FOUND"]]);
+    });
+
+    test("editors get the same review through /lais-editing", async () => {
+      subdivideInVersion();
+      const r = await editing(`/transactions/${valid.Transaction_ID}/changes`);
+      assert.equal(r.status, 200, JSON.stringify(r.body));
+      assert.equal(r.body.plots.inserted.length, 2);
+      assert.equal((await editing(`/transactions/NO-SUCH-ID/changes`)).body.error.code, "not_found");
+    });
   });
 
   test("the record named by the editor is used when it is not named after the version", async () => {
@@ -1289,6 +1493,22 @@ describe("registrar's decision (LAIS → GIS): approve assigns UPIs and posts; r
     assert.equal((await editing(`/transactions/${valid.Transaction_ID}/editing-done`, { method: "POST", body: "{}" })).body.error.code, "already_approved");
   });
 
+  test("approve when sde.DEFAULT is protected and the account can't post: 503 (not a retry-later 502), nothing posted, same UPIs once fixed", async () => {
+    const eventId = await ready();
+    fake.defaultProtected = true;
+    let r = await decide("approve", { event_id: eventId, approved_by: "r" });
+    assert.deepEqual([r.status, codes(r.body)], [503, ["GIS_NOT_CONFIGURED"]]);
+    assert.equal(fake.plots.get(1)!.retiredbyrecord, undefined, "nothing reached DEFAULT");
+    let list = await editing("/transactions");
+    assert.match(list.body.transactions[0].decision.error, /protected/);
+    fake.defaultProtected = false;
+    r = await decide("approve", { event_id: eventId, approved_by: "r" });
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    assert.deepEqual(r.body.data.approval.upis.map((u: any) => u.UPI), ["1/02/13/02/9010", "1/02/13/02/9011"], "the same UPIs as the first attempt");
+    list = await editing("/transactions");
+    assert.equal(list.body.transactions[0].decision.kind, "approved");
+  });
+
   test("only the work LAIS received can be approved: unknown 404, nothing sent yet, another event_id", async () => {
     assert.equal((await decide("approve", { event_id: crypto.randomUUID(), approved_by: "r" }, second)).status, 404);
     let r = await decide("approve", { event_id: crypto.randomUUID(), approved_by: "r" });
@@ -1416,12 +1636,14 @@ describe("registrar's decision (LAIS → GIS): approve assigns UPIs and posts; r
   test("reject: recorded once with the reason; nothing in GIS changes; the editor sends again and LAIS approves the new work", async () => {
     const first = await ready();
     const before = await laisView();
+    // "Editing done" itself wrote editing_status in the version; the rejection must add nothing.
+    const editsBefore = gisCalls("/startEditing").length;
     const reason = "The boundary between the two new parcels does not follow the survey plan.";
     let r = await decide("reject", { event_id: first, rejected_by: "registrar.one", reason });
     assert.equal(r.status, 200, JSON.stringify(r.body));
     assert.deepEqual([r.body.data.rejection.event_id, r.body.data.rejection.reason], [first, reason]);
     assert.equal((await laisView()).data.updated_at, before.data.updated_at, "LAIS decided it; its view does not change");
-    assert.equal(gisCalls("/startEditing").length, 0);
+    assert.equal(gisCalls("/startEditing").length, editsBefore);
 
     assert.deepEqual(codes((await decide("reject", { event_id: first, rejected_by: "registrar.one", reason })).body), ["ALREADY_REJECTED"]);
     assert.deepEqual(codes((await decide("approve", { event_id: first, approved_by: "registrar.one" })).body), ["ALREADY_REJECTED"]);
@@ -1433,6 +1655,252 @@ describe("registrar's decision (LAIS → GIS): approve assigns UPIs and posts; r
     r = await decide("approve", { event_id: revised, approved_by: "registrar.one" });
     assert.equal(r.status, 200, JSON.stringify(r.body));
     assert.deepEqual(codes((await decide("reject", { event_id: revised, rejected_by: "registrar.one", reason })).body), ["ALREADY_APPROVED"]);
+  });
+});
+
+describe("subdivision completion webhook: reconciler (GIS → outbox) and delivery to App B", () => {
+  type OutboxMod = typeof import("../src/webhooks/outbox.js");
+  let FileOutbox: OutboxMod["FileOutbox"];
+  let reconcile: typeof import("../src/webhooks/subdivisionCompletion.js").reconcileSubdivisions;
+  let dispatchDue: typeof import("../src/webhooks/dispatcher.js").dispatchDue;
+  let signing: typeof import("../src/webhooks/signing.js");
+  let withToken: typeof import("../src/lais/arcgisClient.js").withServiceToken;
+  const APP_B_SECRET = "app-b-shared-secret-0123456789abcdef";
+  const PLACE = { province: "Kigali City", district: "Gasabo", sector: "Remera", cell: "Nyarutarama", village: "Kamahwa" };
+  const EDITED = Date.parse("2026-11-27T09:15:00Z");
+  let box: InstanceType<OutboxMod["FileOutbox"]>;
+  let boxFile = "";
+  let boxNo = 0;
+
+  /** What an editor's Subdivision of plot 1 into 11 + 12 looks like in DEFAULT after Reconcile & Post. */
+  function postSubdivision(upi12: string | null = "1/02/13/02/1102") {
+    Object.assign(fake.plots.get(1)!, { retiredbyrecord: "{SUB-REC}", size: 100, globalid: "{G-1}", ...PLACE, last_edited_date: EDITED });
+    fake.plots.set(11, { objectid: 11, globalid: "{G-11}", name: "1/02/13/02/1101", createdbyrecord: "{SUB-REC}", size: 50.004, ...PLACE, last_edited_date: EDITED, transaction_id: null });
+    fake.plots.set(12, { objectid: 12, globalid: "{G-12}", name: upi12, createdbyrecord: "{SUB-REC}", size: 49.996, ...PLACE, last_edited_date: EDITED, transaction_id: null });
+    fake.records.push({ globalid: "{SUB-REC}", name: "SUBV-LAIS-SUB-2026-00125-20261124", recordeddate: Date.parse("2026-11-27T00:00:00Z") });
+  }
+  const run = (now = Date.now()) => reconcile(box, withToken, now);
+
+  before(async () => {
+    ({ FileOutbox } = await import("../src/webhooks/outbox.js"));
+    ({ reconcileSubdivisions: reconcile } = await import("../src/webhooks/subdivisionCompletion.js"));
+    ({ dispatchDue } = await import("../src/webhooks/dispatcher.js"));
+    signing = await import("../src/webhooks/signing.js");
+    ({ withServiceToken: withToken } = await import("../src/lais/arcgisClient.js"));
+  });
+  beforeEach(async () => {
+    cfg.LAIS_WRITE_MODE = "version-only";
+    cfg.SUBDIVISION_WEBHOOK_SINCE = "";
+    boxFile = path.join(auditDir, "webhooks", `outbox-${++boxNo}.json`);
+    // Tracking began before this test's transactions were accepted.
+    box = new FileOutbox(boxFile);
+    await box.trackingSince(Date.now() - 60_000);
+  });
+
+  test("not posted yet (InReview) → no event; posted → one event with every attribute from sde.DEFAULT", async () => {
+    assert.equal((await submit(valid)).status, 201);
+    let s = await run();
+    assert.deepEqual([s.checked, s.created], [1, 0]);
+    assert.equal((await box.events()).length, 0);
+
+    postSubdivision();
+    s = await run();
+    assert.equal(s.created, 1);
+    const [event] = await box.events();
+    const p = event!.payload as Record<string, any>;
+    assert.equal(event!.id, signing.stableEventId("subdivision.completed", valid.Transaction_ID));
+    assert.deepEqual([p.event_id, p.event_type, p.event_version], [event!.id, "subdivision.completed", "1.0"]);
+    assert.equal(p.data.Transaction_ID, valid.Transaction_ID);
+    assert.equal(p.data.Transaction_Type, "Subdivision");
+    assert.equal(p.data.detected_via, "record");
+    assert.deepEqual(p.data.records, [{ global_id: "{SUB-REC}", name: "SUBV-LAIS-SUB-2026-00125-20261124", recorded_date: "2026-11-27T00:00:00.000Z" }]);
+    assert.equal(p.data.completed_at, new Date(EDITED).toISOString());
+
+    // the original parcel: its reference and all its attributes, now historic
+    assert.deepEqual([p.data.original_parcel.UPI, p.data.original_parcel.object_id, p.data.original_parcel.global_id, p.data.original_parcel.current], ["1/02/13/02/1001", 1, "{G-1}", false]);
+    assert.equal(p.data.original_parcel.attributes.retiredbyrecord, "{SUB-REC}");
+
+    // the resulting parcels: UPIs and every attribute as stored (no invented values), dates as ISO
+    assert.deepEqual(p.data.resulting_parcels.map((x: any) => [x.UPI, x.object_id, x.global_id, x.current, x.area_sqm]), [["1/02/13/02/1101", 11, "{G-11}", true, 50], ["1/02/13/02/1102", 12, "{G-12}", true, 50]]);
+    assert.deepEqual(p.data.resulting_parcels[0].attributes, { objectid: 11, globalid: "{G-11}", name: "1/02/13/02/1101", createdbyrecord: "{SUB-REC}", size: 50.004, ...PLACE, last_edited_date: new Date(EDITED).toISOString(), transaction_id: null });
+    assert.equal(p.data.resulting_parcels[0].geometry.type, "Polygon");
+  });
+
+  test("detection does not depend on LAIS polling, and an event is never created twice (also after a restart)", async () => {
+    await submit(valid);
+    postSubdivision(); // nobody calls GET /transactions: the reconciler alone finds it
+    assert.equal((await run()).created, 1);
+    assert.equal((await run()).created, 0);
+    box = new FileOutbox(boxFile); // restarted process, same file
+    assert.equal((await run()).created, 0);
+    assert.equal((await box.events()).length, 1);
+  });
+
+  test("recovery after downtime: a subdivision posted while the worker was down is found on its first run", async () => {
+    await submit(valid);
+    postSubdivision();
+    // the worker was down for a day; it starts now
+    const s = await run(Date.now() + 24 * 3600_000);
+    assert.equal(s.created, 1);
+  });
+
+  test("only Subdivisions: Merge, CorrectBoundaries and CreatePlot never produce an event, even when posted", async () => {
+    await submit({ UPIs: ["1/02/13/02/1001", "1/02/13/02/3003"], Transaction_ID: "MRG-W", Transaction_Type: "Merge", Transaction_Date: "2026-11-26T10:00:00Z" });
+    for (const id of [1, 4]) fake.plots.get(id)!.retiredbyrecord = "{MRG-REC}";
+    fake.plots.set(13, { objectid: 13, name: "1/02/13/02/1313", createdbyrecord: "{MRG-REC}" });
+    await submit({ UPI: "1/02/13/02/9009", Transaction_ID: "COR-W", Transaction_Type: "CorrectBoundaries", Transaction_Date: "2026-11-26T10:00:00Z" });
+    fake.records.push({ globalid: "{COR-REC}", name: "CORB-COR-W-20261126" });
+    await submit({ Transaction_ID: "NEW-W", Transaction_Type: "CreatePlot", Transaction_Date: "2026-11-25T10:00:00Z" });
+    fake.records.push({ globalid: "{NEW-REC}", name: "CRPL-NEW-W-20261125" });
+    fake.plots.set(14, { objectid: 14, name: "1/02/13/02/1414", createdbyrecord: "{NEW-REC}" });
+    const s = await run();
+    assert.deepEqual([s.checked, s.created], [0, 0], "not even checked");
+    assert.equal((await box.events()).length, 0);
+  });
+
+  test("Closed (version removed without posting) → no event, and it is not checked again", async () => {
+    await submit(valid);
+    fake.versions = [];
+    let s = await run();
+    assert.deepEqual([s.checked, s.created], [1, 0]);
+    s = await run();
+    assert.equal(s.checked, 0, "Closed is final");
+  });
+
+  test("incomplete result (a resulting parcel without UPI) waits, then the event is sent once GIS assigns it", async () => {
+    await submit(valid);
+    postSubdivision(null);
+    let s = await run();
+    assert.deepEqual([s.created, s.waiting], [0, 1]);
+    let waiting = await box.waiting();
+    assert.equal(waiting.length, 1);
+    assert.match(waiting[0]!.reason, /1 resulting parcel\(s\) have no UPI yet/);
+    s = await run();
+    assert.equal(s.waiting, 1);
+    assert.equal((await box.waiting())[0]!.checks, 2, "checked again on every run");
+
+    fake.plots.get(12)!.name = "1/02/13/02/1102";
+    s = await run();
+    assert.equal(s.created, 1);
+    waiting = await box.waiting();
+    assert.equal(waiting.length, 0);
+    const [event] = await box.events();
+    assert.deepEqual((event!.payload as any).data.resulting_parcels.map((x: any) => x.UPI), ["1/02/13/02/1101", "1/02/13/02/1102"]);
+  });
+
+  test("area_sqm is the boundary's area (shape area field), not a stale stored size; the stored size still goes out as is", async () => {
+    await submit(valid);
+    postSubdivision();
+    // as seen live: the original's `size` was never updated after an earlier edit, its shape is the truth
+    Object.assign(fake.plots.get(1)!, { size: 6136.92, Shape__Area: 100.004 });
+    Object.assign(fake.plots.get(11)!, { size: null, Shape__Area: 50.004 });
+    Object.assign(fake.plots.get(12)!, { size: 70, Shape__Area: 50 });
+    assert.equal((await run()).created, 1);
+    const d = ((await box.events())[0]!.payload as any).data;
+    assert.equal(d.original_parcel.area_sqm, 100);
+    assert.equal(d.original_parcel.attributes.size, 6136.92);
+    assert.deepEqual(d.resulting_parcels.map((p: any) => [p.area_sqm, p.attributes.size]), [[50, null], [50, 70]]);
+  });
+
+  test("a subdivision into one parcel is never sent", async () => {
+    await submit(valid);
+    postSubdivision();
+    fake.plots.delete(12);
+    const s = await run();
+    assert.equal(s.created, 0);
+    assert.match((await box.waiting())[0]!.reason, /at least 2 parcels; GIS found 1/);
+  });
+
+  test("a posted record that did not retire the transaction's parcel is never sent as its completion", async () => {
+    await submit(valid);
+    postSubdivision();
+    // the record named after the version retired another parcel, not 1/02/13/02/1001
+    delete fake.plots.get(1)!.retiredbyrecord;
+    fake.plots.get(8)!.retiredbyrecord = "{SUB-REC}";
+    const s = await run();
+    assert.equal(s.created, 0);
+    assert.match((await box.waiting())[0]!.reason, /original parcel 1\/02\/13\/02\/1001 is not retired in sde\.DEFAULT/);
+  });
+
+  test("transactions accepted before tracking began (or before SUBDIVISION_WEBHOOK_SINCE) are not replayed", async () => {
+    await submit(valid);
+    postSubdivision();
+    cfg.SUBDIVISION_WEBHOOK_SINCE = new Date(Date.now() + 3600_000).toISOString();
+    assert.equal((await run()).checked, 0);
+    cfg.SUBDIVISION_WEBHOOK_SINCE = "";
+    box = new FileOutbox(path.join(auditDir, "webhooks", `outbox-late-${boxNo}.json`));
+    await box.trackingSince(Date.now() + 3600_000); // first enabled after the transaction was accepted
+    assert.equal((await run()).checked, 0);
+  });
+
+  test("end to end: posted subdivision → event → signed POST to App B, acknowledged once", async () => {
+    await submit(valid);
+    postSubdivision();
+    await run();
+    const s = await dispatchDue(box, { url: APP_B, secrets: [APP_B_SECRET], timeoutMs: 2000, maxAttempts: 5, backoff: { baseMs: 30_000, maxMs: 3600_000 } });
+    assert.equal(s.delivered, 1);
+    const call = fake.appB.calls[0]!;
+    const ts = Number(call.headers.get("x-webhook-timestamp"));
+    assert.ok(signing.verifySignature(call.headers.get("x-webhook-signature")!, [APP_B_SECRET], ts, call.raw, Math.floor(Date.now() / 1000)));
+    assert.equal(call.headers.get("x-webhook-event"), "subdivision.completed");
+    assert.equal(JSON.parse(call.raw).data.Transaction_ID, valid.Transaction_ID);
+    assert.equal((await box.events())[0]!.status, "delivered");
+  });
+
+  test("administration API: administrators only; lists events and waiting results; replays only dead letters", async () => {
+    const { subdivisionOutbox } = await import("../src/webhooks/worker.js");
+    box = subdivisionOutbox(); // the outbox the API serves
+    await box.trackingSince(Date.now() - 60_000);
+    const admin = base.replace(/\/lais$/, "/webhooks/subdivision");
+    const call = async (p: string, token: string | null, method = "GET") => {
+      const res = await fetch(`${admin}${p}`, { method, headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...client() } });
+      return { status: res.status, body: (await res.json()) as Record<string, any> };
+    };
+
+    // who may use it
+    assert.equal((await call("/events", null)).status, 401);
+    assert.equal((await call("/events", "viewer-1")).status, 403);
+    assert.equal((await call("/events", "editor-1")).status, 403);
+    assert.equal((await call("/events?status=bogus", "admin-1")).status, 400);
+
+    // a posted subdivision with a parcel still lacking its UPI is listed as waiting, not sent
+    await submit(valid);
+    postSubdivision(null);
+    await run();
+    let r = await call("/waiting", "admin-1");
+    assert.equal(r.status, 200);
+    assert.equal(r.body.waiting.length, 1);
+    assert.equal(r.body.waiting[0].key.toLowerCase(), valid.Transaction_ID.toLowerCase());
+
+    // GIS assigns it: the event is created, waiting is cleared
+    fake.plots.get(12)!.name = "1/02/13/02/1102";
+    await run();
+    r = await call("/events", "admin-1");
+    assert.equal(r.status, 200);
+    assert.equal(r.body.enabled, false);
+    assert.equal(r.body.events.length, 1);
+    const id = r.body.events[0].id as string;
+    assert.equal(r.body.events[0].status, "pending");
+    assert.equal(r.body.events[0].payload.data.resulting_parcels.length, 2);
+    assert.equal(JSON.stringify(r.body).includes(APP_B_SECRET), false);
+    assert.equal((await call("/waiting", "admin-1")).body.waiting.length, 0);
+
+    // a pending event cannot be replayed; App B refuses it (400) → dead letter → replay puts it back
+    r = await call(`/events/${id}/replay`, "admin-1", "POST");
+    assert.deepEqual([r.status, r.body.error.code], [409, "not_dead_lettered"]);
+    fake.webhook.answers.push({ status: 400, body: { error: "bad" } });
+    await dispatchDue(box, { url: WEBHOOK, secrets: [APP_B_SECRET], timeoutMs: 2000, maxAttempts: 5, backoff: { baseMs: 30_000, maxMs: 3600_000 } });
+    r = await call("/events?status=dead", "admin-1");
+    assert.equal(r.body.events.length, 1);
+    assert.match(r.body.events[0].deadReason, /400/);
+    assert.equal((await call(`/events/${id}/replay`, "editor-1", "POST")).status, 403);
+    r = await call(`/events/${id}/replay`, "admin-1", "POST");
+    assert.equal(r.status, 200);
+    assert.equal(r.body.event.status, "pending");
+    assert.equal((await call("/events?status=dead", "admin-1")).body.events.length, 0);
+    const s = await dispatchDue(box, { url: APP_B, secrets: [APP_B_SECRET], timeoutMs: 2000, maxAttempts: 5, backoff: { baseMs: 30_000, maxMs: 3600_000 } });
+    assert.equal(s.delivered, 1);
+    assert.equal((await call("/events?status=delivered", "admin-1")).body.events.length, 1);
   });
 });
 

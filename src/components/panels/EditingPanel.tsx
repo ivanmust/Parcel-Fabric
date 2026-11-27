@@ -160,6 +160,15 @@ export function EditingPanel() {
 
 type ValidationStatus = Awaited<ReturnType<typeof parcelFabricService.validationStatus>>;
 
+/** The parcels at an error, short enough for a list row. */
+function parcelSummary(p: TopologyProblem): string {
+  if (p.dirty) return "Not validated";
+  if (p.parcels === null) return "Parcels unknown";
+  if (!p.parcels.length) return "No parcel";
+  const shown = p.parcels.slice(0, 2).join(", ");
+  return p.parcels.length > 2 ? `${shown} +${p.parcels.length - 2} more` : shown;
+}
+
 /** Parcel Fabric tools for the edit session: topology validation of the current map view. */
 function ParcelFabricCard() {
   const session = useEditing((s) => s.session);
@@ -168,15 +177,27 @@ function ParcelFabricCard() {
   const canChange = editing && !inDefault;
   const fabricOps = useEditing((s) => s.fabricOpsInSession);
   const [status, setStatus] = useState<ValidationStatus | null>(null);
+  const [selected, setSelected] = useState<TopologyProblem | null>(null);
   const { busy, error, run } = useAsyncAction();
   // A result no longer holds after Save, Discard, or starting or stopping editing.
-  useEffect(() => setStatus(null), [session]);
+  useEffect(() => {
+    setStatus(null);
+    setSelected(null);
+  }, [session]);
+  // Every listed error is drawn on the map in red until the next check (dirty areas are not errors).
+  useEffect(() => {
+    const geometries = (status?.problems ?? []).flatMap((p) => (!p.dirty && p.geometry ? [p.geometry] : []));
+    getMapController().showTopologyErrors(geometries);
+  }, [status]);
+  useEffect(() => () => getMapController().showTopologyErrors([]), []);
 
+  /** Zoom to an error and show what is wrong. The app only shows errors: the surveyor corrects them. */
   const showProblem = (problem: TopologyProblem) =>
     run(async () => {
+      setSelected(problem);
       const ctrl = getMapController();
       if (!ctrl.view) throw new Error("The map is not ready.");
-      const geometry = await parcelFabricService.problemGeometry(problem, ctrl.view.spatialReference);
+      const geometry = problem.geometry ?? (await parcelFabricService.problemGeometry(problem, ctrl.view.spatialReference));
       if (!geometry) throw new Error("That error no longer exists. Check errors again.");
       await ctrl.showOutline(geometry);
     }, "Zooming to the error");
@@ -251,9 +272,37 @@ function ParcelFabricCard() {
       {status && status.problems.length > 0 && (
         <calcite-list id="parcel-fabric-problems" label="Errors in this map view" scale="s" style={{ maxHeight: 240, overflow: "auto" }}>
           {status.problems.map((p) => (
-            <calcite-list-item key={`${p.layerKey}:${p.objectId}`} label={p.label} description={`${p.detail}. Click to zoom.`} onClick={() => void showProblem(p)} />
+            <calcite-list-item
+              key={`${p.layerKey}:${p.objectId}`}
+              label={p.label}
+              description={`${parcelSummary(p)} · ${p.explanation.what}`}
+              selected={(selected?.layerKey === p.layerKey && selected.objectId === p.objectId) || undefined}
+              onClick={() => void showProblem(p)}
+            />
           ))}
         </calcite-list>
+      )}
+      {selected && (
+        <div className="svc-card" id="topology-error-detail" style={{ padding: 8 }}>
+          <div className="ps-row space">
+            <strong style={{ fontSize: 13 }}>{selected.label}</strong>
+            <calcite-action icon="x" text="Close" scale="s" onClick={() => setSelected(null)} />
+          </div>
+          <div style={{ fontSize: 12, marginTop: 4 }}>{selected.explanation.what}</div>
+          {!selected.dirty && (
+            <div style={{ fontSize: 12, marginTop: 6 }}>
+              <span className="muted">Parcels: </span>
+              {selected.parcels === null ? "could not be read" : selected.parcels.length ? selected.parcels.join(", ") : "none (no parcel at this error)"}
+            </div>
+          )}
+          <div style={{ fontSize: 12, marginTop: 6 }}>
+            <span className="muted">To check: </span>
+            {selected.explanation.check}
+          </div>
+          <div className="muted" style={{ fontSize: 11, marginTop: 6 }}>
+            {selected.detail}. The app only shows errors; correcting the parcels is the surveyor's responsibility.
+          </div>
+        </div>
       )}
       {status && status.dirtyAreas > 0 && (
         <div className="muted" style={{ fontSize: 12 }}>Parts of this view are not validated yet, so their errors can't be known. Validate to find them.</div>

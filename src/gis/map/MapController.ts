@@ -45,6 +45,8 @@ export class MapController {
   readonly map: ArcGISMap;
   readonly basemaps: Basemap[];
   readonly markerLayer = new GraphicsLayer({ id: "app-markers", title: "Markers", listMode: "hide" });
+  /** The topology errors last listed (Check errors / Validate), all drawn in red. Display only. */
+  readonly topologyErrorLayer = new GraphicsLayer({ id: "app-topology-errors", title: "Topology errors", listMode: "hide" });
   view: MapView | null = null;
   dataSpatialReference: SpatialReference | null = null;
   serviceExtent: Extent | null = null;
@@ -81,7 +83,8 @@ export class MapController {
     });
     view.popup = { dockEnabled: true, dockOptions: { buttonEnabled: true, breakpoint: false, position: "top-right" } } as never;
     this.view = view;
-    this.map.add(this.markerLayer);
+    // Errors below the markers, so the orange outline of the error being looked at draws on top.
+    this.map.addMany([this.topologyErrorLayer, this.markerLayer]);
     this.wireEvents(view);
 
     await view.when();
@@ -358,6 +361,26 @@ export class MapController {
     const span = extent ? Math.max(extent.width, extent.height) : 0;
     const target = extent && span > 0 ? extent.clone().expand(Math.max(1.5, 30 / span)) : { target: geometry, scale: 500 };
     await this.view?.goTo(target, { duration: 400 }).catch(ignoreInterrupt);
+  }
+
+  /** Draw these topology errors in red, replacing those drawn before (empty list: clear them). */
+  showTopologyErrors(geometries: GeometryUnion[]) {
+    const red: [number, number, number] = [220, 38, 38];
+    this.topologyErrorLayer.removeAll();
+    this.topologyErrorLayer.addMany(
+      geometries.map(
+        (geometry) =>
+          new Graphic({
+            geometry,
+            symbol:
+              geometry.type === "point" || geometry.type === "multipoint"
+                ? { type: "simple-marker", style: "x", color: red, size: 12, outline: { color: red, width: 3 } }
+                : geometry.type === "polyline"
+                  ? { type: "simple-line", color: red, width: 4 }
+                  : { type: "simple-fill", color: [...red, 0.25], outline: { color: red, width: 2 } },
+          }),
+      ),
+    );
   }
 
   // ---------------------------------------------------------------- navigation

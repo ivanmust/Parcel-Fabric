@@ -1,10 +1,15 @@
 import esriRequest from "@arcgis/core/request.js";
 import { executeForCount, executeQueryJSON } from "@arcgis/core/rest/query.js";
-import type Extent from "@arcgis/core/geometry/Extent.js";
+import Extent from "@arcgis/core/geometry/Extent.js";
 import type Geometry from "@arcgis/core/geometry/Geometry.js";
+import type Point from "@arcgis/core/geometry/Point.js";
+import type { GeometryUnion } from "@arcgis/core/unionTypes.js";
 import Graphic from "@arcgis/core/Graphic.js";
 import type Polygon from "@arcgis/core/geometry/Polygon.js";
 import * as areaOperator from "@arcgis/core/geometry/operators/areaOperator.js";
+import * as intersectionOperator from "@arcgis/core/geometry/operators/intersectionOperator.js";
+import * as lengthOperator from "@arcgis/core/geometry/operators/lengthOperator.js";
+import type Polyline from "@arcgis/core/geometry/Polyline.js";
 import type SpatialReference from "@arcgis/core/geometry/SpatialReference.js";
 import { layerRegistry, type ServiceLayerInfo } from "../layers/layerRegistry";
 import { hasField, sessionQuery, sessionRows, sqlList, sqlString } from "../layers/query";
@@ -15,6 +20,7 @@ import { useApp } from "../../stores/appStore";
 import { arcgisError, fetchServiceJson } from "../../services/arcgis/serviceMetadata";
 import { LOCATION_FIELDS, UPI_PATTERN } from "./upi";
 import { mergeAdjacencyProblem } from "./adjacency";
+import { DIRTY_AREA_EXPLANATION, explainTopologyError, parcelsAtError, type TopologyErrorExplanation } from "./topologyErrors";
 
 /**
  * Parcel Fabric operations through the ParcelFabricServer and ValidationServer REST extensions.
@@ -226,13 +232,18 @@ function openProblems(i: ServiceLayerInfo): string {
   return "1=1";
 }
 
-let ruleNames: Promise<Map<number, string>> | null = null;
-/** Topology rule names by id, from the service's data elements. */
-function topologyRuleNames(): Promise<Map<number, string>> {
-  ruleNames ??= (async () => {
+interface TopologyRuleInfo {
+  name: string;
+  type: string | null;
+}
+
+let rulesById: Promise<Map<number, TopologyRuleInfo>> | null = null;
+/** Topology rules by id (name and type), from the service's data elements. */
+function topologyRules(): Promise<Map<number, TopologyRuleInfo>> {
+  rulesById ??= (async () => {
     const topologyId = layerRegistry.featureServiceJson?.controllerDatasetLayers?.topologyLayerIds?.[0];
     const url = useApp.getState().config?.services.featureServer;
-    if (topologyId === undefined || !url) return new Map<number, string>();
+    if (topologyId === undefined || !url) return new Map<number, TopologyRuleInfo>();
     const json = await fetchServiceJson(`${url}/queryDataElements`, { query: { layers: JSON.stringify([topologyId]) } });
     const rules: { ruleId: number; name?: string; topologyRuleType?: string }[] = json.layerDataElements?.[0]?.dataElement?.topologyRules ?? [];
     // An unnamed rule shows its type in words, e.g. "Line endpoint covered by point".
@@ -240,13 +251,13 @@ function topologyRuleNames(): Promise<Map<number, string>> {
       const text = type.replace(/^esriTRT/, "").replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase();
       return text.charAt(0).toUpperCase() + text.slice(1);
     };
-    return new Map(rules.map((r) => [r.ruleId, r.name || words(r.topologyRuleType)]));
+    return new Map(rules.map((r) => [r.ruleId, { name: r.name || words(r.topologyRuleType), type: r.topologyRuleType ?? null }]));
   })().catch((e) => {
-    ruleNames = null;
-    useApp.getState().log("warning", "validation", "Topology rule names could not be read", arcgisError(e).message);
-    return new Map<number, string>();
+    rulesById = null;
+    useApp.getState().log("warning", "validation", "Topology rules could not be read", arcgisError(e).message);
+    return new Map<number, TopologyRuleInfo>();
   });
-  return ruleNames;
+  return rulesById;
 }
 
 export interface TopologyProblem {
@@ -254,7 +265,71 @@ export interface TopologyProblem {
   objectId: number;
   label: string;
   detail: string;
+  /** A dirty area (not validated yet) rather than an error. */
+  dirty: boolean;
+  /** What is wrong and what the surveyor must check (see topologyErrors). */
+  explanation: TopologyErrorExplanation;
+  /** UPIs (or object ids) of the current parcels at the error; empty for dirty areas, null when they could not be read. */
+  parcels: string[] | null;
+  /** The error's shape in the map's spatial reference, for drawing it; null when unknown. */
+  geometry: GeometryUnion | null;
 }
+
+/** How a current parcel is named in the error list: its UPI, or its object id when it has none. */
+function parcelLabel(attributes: Record<string, unknown>, oid: string): string {
+  const upi = typeof attributes.name === "string" ? attributes.name.trim() : "";
+  return upi || `Parcel without UPI (OBJECTID ${String(attributes[oid])})`;
+}
+
+/**
+ * The current parcels at an error given in the data's coordinate system (see parcelsAtError). A point
+ * error (e.g. a dangle) is searched in a small box around it, so a corner a few millimetres off counts.
+ */
+async function parcelsAt(geometry: GeometryUnion): Promise<string[]> {
+  const info = parcelLayer();
+  const oid = info.layer.objectIdField;
+  const isArea = geometry.type === "polygon";
+  const isLine = geometry.type === "polyline";
+  let search: Geometry = geometry;
+  if (geometry.type === "point") {
+    const p = geometry as Point;
+    const d = p.spatialReference?.isGeographic ? 0.000005 : 0.5;
+    search = new Extent({ xmin: p.x - d, ymin: p.y - d, xmax: p.x + d, ymax: p.y + d, spatialReference: p.spatialReference });
+  }
+  const q = sessionQuery(info, {
+    where: hasField(info.layer, "retiredbyrecord") ? "retiredbyrecord IS NULL" : "1=1",
+    geometry: search,
+    returnGeometry: isArea || isLine,
+    outFields: [oid, "name"],
+    outSpatialReference: info.layer.spatialReference,
+    num: 20,
+  });
+  const features = (await executeQueryJSON(info.url, q)).features;
+  // The part of the error in the parcel (its boundary included): an area, a length along it, or only
+  // the points where a neighbour touches it (size 0).
+  const size = (g: Geometry | null | undefined) =>
+    g?.type === "polygon" ? Math.abs(areaOperator.execute(g as Polygon)) : g?.type === "polyline" ? lengthOperator.execute(g as Polyline) : 0;
+  const shared = (g: Geometry | null | undefined) => (g && (isArea || isLine) ? size(intersectionOperator.execute(geometry, g as GeometryUnion)) : 0);
+  return parcelsAtError(
+    features.map((f) => ({ label: parcelLabel(f.attributes as Record<string, unknown>, oid), shared: shared(f.geometry) })),
+    size(geometry),
+  );
+}
+
+/** Run `fn` over the items, at most `limit` at a time, so 100 errors don't send 100 queries at once. */
+async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const out: R[] = new Array<R>(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i]!);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return out;
+}
+
 const MAX_PROBLEMS_LISTED = 100;
 
 export const parcelFabricService = {
@@ -405,13 +480,15 @@ export const parcelFabricService = {
 
   /**
    * What validation left in an area, at the session moment: dirty areas, errors by type, a list of
-   * them to zoom to, and how many errors lie elsewhere in the version. Reading needs no edit session.
+   * them (what is wrong, the parcels at each, its shape in the area's spatial reference for drawing),
+   * and how many errors lie elsewhere in the version. Reading needs no edit session and changes nothing.
    */
   async validationStatus(area: Extent) {
     const layers = layerRegistry.allByRole("topology-error");
     const within = inside(area);
-    const [names, found] = await Promise.all([
-      topologyRuleNames(),
+    const dataSr = parcelLayer().layer.spatialReference;
+    const [rules, found] = await Promise.all([
+      topologyRules(),
       Promise.all(
         layers.map(async (info) => {
           const where = openProblems(info);
@@ -419,22 +496,33 @@ export const parcelFabricService = {
           const oid = info.layer.objectIdField;
           const count = await executeForCount(info.url, sessionQuery(info, { where, geometry: within }));
           const total = dirty ? count : await executeForCount(info.url, sessionQuery(info, { where }));
-          const rows = count ? await sessionRows(info, { where, geometry: within, outFields: ["*"], num: MAX_PROBLEMS_LISTED }) : [];
-          return { info, dirty, oid, count, total, rows };
+          const query = sessionQuery(info, { where, geometry: within, outFields: ["*"], num: MAX_PROBLEMS_LISTED, returnGeometry: true, outSpatialReference: dataSr });
+          const features = count ? (await executeQueryJSON(info.url, query)).features : [];
+          return { info, dirty, oid, count, total, features };
         }),
       ),
     ]);
     const errors = found.filter((f) => !f.dirty);
-    const problems: TopologyProblem[] = [...errors, ...found.filter((f) => f.dirty)]
-      .flatMap(({ info, dirty, oid, rows }) =>
-        rows.map((r) => ({
-          layerKey: info.key,
-          objectId: r[oid] as number,
-          label: dirty ? "Not validated yet" : (names.get(r.toporuleid as number) ?? `Topology rule ${String(r.toporuleid)}`),
-          detail: `${info.name} #${String(r[oid])}`,
-        })),
+    const listed = [...errors, ...found.filter((f) => f.dirty)]
+      .flatMap(({ info, dirty, oid, features }) =>
+        features.map((f) => ({ info, dirty, oid, row: f.attributes as Record<string, unknown>, geometry: (f.geometry as GeometryUnion | null) ?? null })),
       )
       .slice(0, MAX_PROBLEMS_LISTED);
+    await ensureProjection();
+    const problems = await mapLimit(listed, 6, async ({ info, dirty, oid, row, geometry }): Promise<TopologyProblem> => {
+      const rule = dirty ? undefined : rules.get(row.toporuleid as number);
+      const label = dirty ? "Not validated yet" : (rule?.name ?? `Topology rule ${String(row.toporuleid)}`);
+      return {
+        layerKey: info.key,
+        objectId: row[oid] as number,
+        label,
+        detail: `${info.name} #${String(row[oid])}`,
+        dirty,
+        explanation: dirty ? DIRTY_AREA_EXPLANATION : explainTopologyError(rule?.type, label),
+        parcels: dirty || !geometry ? [] : await parcelsAt(geometry).catch(() => null),
+        geometry: geometry ? project(geometry, area.spatialReference) : null,
+      };
+    });
     return {
       dirtyAreas: found.find((f) => f.dirty)?.count ?? 0,
       errors: errors.map(({ info, count }) => ({ layerKey: info.key, name: info.name, count })),

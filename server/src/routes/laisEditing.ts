@@ -1,11 +1,13 @@
 import { Router, type Request } from "express";
 import { z } from "zod";
 import { requireAuth, requirePermission } from "../middleware/authenticate.js";
+import { requireApiKeyOrPermission } from "../middleware/apiKey.js";
 import { HttpError } from "../utils/httpError.js";
 import { logger } from "../logging/logger.js";
 import { writeAudit } from "../audit/auditLog.js";
 import { withServiceToken } from "../lais/arcgisClient.js";
 import { LaisConfigurationError } from "../lais/laisService.js";
+import { ChangesError, versionChanges } from "../lais/versionChanges.js";
 import { EditingDoneError, editingDoneEnabled, previewEditingDone, requestEditingDone, transactionsForEditors, webhookConfigured } from "../lais/editingDone.js";
 
 /**
@@ -14,6 +16,24 @@ import { EditingDoneError, editingDoneEnabled, previewEditingDone, requestEditin
  * transaction versions; nothing is edited.
  */
 export const laisEditing = Router();
+
+/**
+ * What would be sent to LAIS, with any problems to fix first. Sends nothing. Besides signed-in editors,
+ * API clients (e.g. Swagger) may read it with the LAIS API key (X-API-Key), which does not expire.
+ * Registered before the router-wide sign-in check below, so the key alone is enough here.
+ */
+laisEditing.get("/transactions/:transactionId/preview", requireApiKeyOrPermission("features:edit"), async (req, res) => {
+  requireEnabled();
+  const id: string = idOf(req);
+  const recordName = typeof req.query.recordName === "string" ? req.query.recordName.trim().slice(0, 255) : undefined;
+  try {
+    res.json(await previewEditingDone(id, recordName, req.user?.username ?? ""));
+  } catch (error) {
+    throw failure(error, id, "preview");
+  }
+});
+
+// Every other endpoint: signed-in editors only.
 laisEditing.use(requireAuth, requirePermission("features:edit"));
 
 const requireEnabled = () => {
@@ -45,22 +65,22 @@ laisEditing.get("/transactions", async (_req, res) => {
   res.json({ enabled: editingDoneEnabled(), configured: webhookConfigured(), transactions: await transactionsForEditors() });
 });
 
-/** What would be sent to LAIS, with any problems to fix first. Sends nothing. */
-laisEditing.get("/transactions/:transactionId/preview", async (req, res) => {
-  requireEnabled();
+/** What the transaction's version changed compared with sde.DEFAULT, for the editor to review before "Editing done". */
+laisEditing.get("/transactions/:transactionId/changes", async (req, res) => {
   const id = idOf(req);
-  const recordName = typeof req.query.recordName === "string" ? req.query.recordName.trim().slice(0, 255) : undefined;
+  const geometry = String(req.query.geometry ?? "false").toLowerCase() === "true";
   try {
-    res.json(await withServiceToken((token) => previewEditingDone(token, id, req.user!.username, recordName)));
+    res.json(await withServiceToken((token) => versionChanges(token, id, { geometry })));
   } catch (error) {
-    throw failure(error, id, "preview");
+    if (error instanceof ChangesError) throw new HttpError(error.status, error.message, error.code.toLowerCase());
+    throw failure(error, id, "changes");
   }
 });
 
 /** The editor has finished: send the work to LAIS for the registrar's approval. */
 laisEditing.post("/transactions/:transactionId/editing-done", async (req, res) => {
   requireEnabled();
-  const id = idOf(req);
+  const id: string = idOf(req);
   const body = Body.safeParse(req.body ?? {});
   if (!body.success) throw new HttpError(400, "Invalid request", "invalid_body", body.error.issues);
   const audit = (outcome: "success" | "failure", details: Record<string, unknown>) =>
